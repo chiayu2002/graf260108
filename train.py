@@ -90,9 +90,8 @@ def main():
     
     # 初始化 wandb
     wandb.init(
-        project="graf250520",
-        # entity="vicky20020808",
-        name="RS307 330",
+        project=config['wandb']['project'],
+        name=config['wandb']['name'],
         config=config
     )
 
@@ -169,7 +168,7 @@ def main():
             first_label = label[:,0]
             first_label = first_label.long()
             batch_size = first_label.size(0)
-            one_hot = torch.zeros(batch_size, 1, device=first_label.device)
+            one_hot = torch.zeros(batch_size, 2, device=first_label.device)
             one_hot.scatter_(1, first_label.unsqueeze(1), 1)
             
             generator.ray_sampler.iterations = it

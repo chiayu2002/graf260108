@@ -1,6 +1,6 @@
-expname: column251023_view
+expname: column260108_0730
 data:
-  datadir: [data/RS307_n]
+  datadir: [data/RS307_n, data/RS330_n]
   far: 4.5
   fov: 20
   imsize: 256  
@@ -18,7 +18,7 @@ data:
   # v: 0.5, 0.36, 0.4, 0.3, 0.2, 0.16, 0.1
   v: 0.5, 0.4, 0.3, 0.2 
 discriminator:
-  num_classes: 1   
+  num_classes: 2   
   hflip: false
   ndf: 64 #64 #128
 nerf:
@@ -75,3 +75,7 @@ ccsr:
     scale_factor: 4,
     alpha_init: 1.0,
     alpha_decay: 0.0001
+wandb:
+  project: graf260108
+  entity: vicky20020808
+  name: RS0730_test
