@@ -1,0 +1,11 @@
+/data
+/results
+model_params.txt
+/loss
+/output
+.history
+*.txt
+*.jpg
+/wandb
+*.pth
+/txt
