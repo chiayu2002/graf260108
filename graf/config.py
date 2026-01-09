@@ -102,7 +102,7 @@ def build_models(config, disc=True):
                           orthographic=config['data']['orthographic'],
                           v=config['data']['v'],
                           use_default_rays=config['data']['use_default_rays'],
-                          use_ccsr=True,  # 啟用CCSR
+                          use_ccsr=False,  # 啟用CCSR
                           num_views=8
                           )
     

@@ -52,13 +52,10 @@ def initialize_training(config, device):
     )
     
     # Create models
-    generator, discriminator = build_models(config) #, qhead, dhead
+    generator, discriminator = build_models(config)
     generator = generator.to(device)
     discriminator = discriminator.to(device)
-    # qhead = qhead.to(device)
-    # dhead = dhead.to(device)
-    
-    return train_loader, generator, discriminator #, qhead, dhead
+    return train_loader, generator, discriminator
 
 def set_random_seed(seed):
     torch.manual_seed(seed)
@@ -82,6 +79,7 @@ def main():
     batch_size=config['training']['batch_size']
     fid_every = config['training']['fid_every']
     save_best = config['training']['save_best']
+    reg_param = config['training']['reg_param']
     device = torch.device("cuda:0")
     
     # 創建目錄
@@ -98,7 +96,7 @@ def main():
     # 初始化model
     train_loader, generator, discriminator = initialize_training(config, device) #, qhead, dhead 
 
-    ccsr_nerf_loss = CCSRNeRFLoss().to(device)
+    # ccsr_nerf_loss = CCSRNeRFLoss().to(device)
 
     file_path = os.path.join(out_dir, "model_architecture.txt")
     with open(file_path, 'w') as f:
@@ -117,8 +115,6 @@ def main():
     lr_d = config['training']['lr_d']
     g_params = generator.parameters()
     d_params = discriminator.parameters()
-    # g_params = list(generator.parameters()) + list(qhead.parameters())
-    # d_params = list(discriminator.parameters()) + list(dhead.parameters())
     g_optimizer = optim.RMSprop(g_params, lr=lr_g, alpha=0.99, eps=1e-8)
     d_optimizer = optim.RMSprop(d_params, lr=lr_d, alpha=0.99, eps=1e-8)
     # g_optimizer = optim.Adam(g_params, lr=lr_g, betas=(0.5, 0.999), eps=1e-8)
@@ -164,20 +160,14 @@ def main():
         for x_real, label in tqdm(train_loader, desc=f"Epoch {epoch_idx}"):
             it += 1
 
-            mce_loss = MCE_Loss()
-            first_label = label[:,0]
-            first_label = first_label.long()
-            batch_size = first_label.size(0)
-            one_hot = torch.zeros(batch_size, 2, device=first_label.device)
-            one_hot.scatter_(1, first_label.unsqueeze(1), 1)
-            
+            criterion_cls = torch.nn.CrossEntropyLoss().to(device)
+            real_cls_labels = label[:, 0].long().to(device)
+
             generator.ray_sampler.iterations = it
             toggle_grad(generator, False)
             toggle_grad(discriminator, True)
             generator.train()
             discriminator.train()
-            # qhead.train()
-            # dhead.train()
 
             # Discriminator updates
             d_optimizer.zero_grad()
@@ -190,15 +180,9 @@ def main():
             
             #real data
             d_real, label_real = discriminator(rgbs, label)
-            # output1 = discriminator(rgbs, label)
-            # d_real = dhead(output1)
             dloss_real = compute_loss(d_real, 1)
-            one_hot = one_hot.to(label_real.device)
-            # d_label_loss = mce_loss([2], label_real, one_hot)
-            # dloss_real.backward()
-            # dloss_real.backward(retain_graph=True)
-            reg = 80. * compute_grad2(d_real, rgbs).mean()
-            # reg.backward()
+            # d_class_loss = criterion_cls(label_real, real_cls_labels)
+            reg = reg_param * compute_grad2(d_real, rgbs).mean()
             
             #fake data
             with torch.no_grad():
@@ -206,16 +190,10 @@ def main():
             x_fake.requires_grad_()
 
             d_fake, _ = discriminator(x_fake, label)
-            # output2 = discriminator(x_fake, label)
-            # d_fake = dhead(output2)
             dloss_fake = compute_loss(d_fake, 0)
-            # dloss_fake.backward()
-            # reg = 10. * wgan_gp_reg(discriminator, rgbs, x_fake, label)
-            # reg.backward()
 
-            # dloss = dloss_real + dloss_fake
-            total_d_loss = dloss_real + dloss_fake + reg #+ d_label_loss 
-            # dloss_all = dloss_real + dloss_fake +reg
+            # total_d_loss = dloss_real + dloss_fake + reg + d_class_loss 
+            total_d_loss = dloss_real + dloss_fake + reg
             total_d_loss.backward()
             d_optimizer.step()
             d_scheduler.step()
@@ -228,26 +206,20 @@ def main():
             toggle_grad(discriminator, False)
             generator.train()
             discriminator.train()
-            # qhead.train()
-            # dhead.train()
             g_optimizer.zero_grad()
 
             z = zdist.sample((batch_size,))
-            # x_fake, _= generator(z, label)
-            x_fake, _, ccsr_output = generator(z, label, return_ccsr_output=True)
+            x_fake, _= generator(z, label)
+            # x_fake, _, ccsr_output = generator(z, label, return_ccsr_output=True)
             d_fake, label_fake = discriminator(x_fake, label)
-            # output = discriminator(x_fake, label)
-            # d_fake = dhead(output)
-            # g_label_loss = mce_loss([2], label_fake, one_hot)
 
-            gloss = compute_loss(d_fake, 1) 
-            ccsr_consistency_loss = ccsr_nerf_loss(ccsr_output, x_fake)
-            # label_fake = qhead(output)
-            # label_loss = mce_loss([2], label_fake, one_hot.to(device))
-            gloss_all = gloss + ccsr_consistency_loss#+ g_label_loss
+            gloss = compute_loss(d_fake, 1)
+            # g_class_loss = criterion_cls(label_fake, real_cls_labels) 
+            # ccsr_consistency_loss = ccsr_nerf_loss(ccsr_output, x_fake)
+            # gloss_all = gloss  + g_class_loss #+ ccsr_consistency_loss
+            gloss_all = gloss   #+ ccsr_consistency_loss
 
             gloss_all.backward()
-            # gloss.backward()
             g_optimizer.step()
             g_scheduler.step()
 
@@ -257,9 +229,11 @@ def main():
             if (it + 1) % config['training']['print_every'] == 0:
                 wandb.log({
                     "loss/generator": gloss,
-                    "loss/ccsr_consistency": ccsr_consistency_loss,
+                    # "loss/glabel": g_class_loss,
+                    # "loss/ccsr_consistency": ccsr_consistency_loss,
                     "loss/generator_total": gloss_all,
                     "loss/discriminator": total_d_loss,
+                    # "loss/dlabel": d_class_loss,
                     "loss/regularizer": reg,
                     "learning rate/generator": current_lr_g,
                     "learning rate/discriminator": current_lr_d,
@@ -295,7 +269,6 @@ def main():
                     "sample/rgb": [wandb.Image(rgb, caption=f"RGB at iter {it}")],
                     "sample/depth": [wandb.Image(depth, caption=f"Depth at iter {it}")],
                     "sample/acc": [wandb.Image(acc, caption=f"Acc at iter {it}")],
-                    # "visualization/coordinate_system": wandb.Image(coordinate_viz_path, caption=f"座標系統 {it}"),
                     "epoch_idx": epoch_idx,
                     "iteration": it
                 })

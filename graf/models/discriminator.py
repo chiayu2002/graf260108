@@ -15,6 +15,7 @@ class Discriminator(nn.Module):
         IN = lambda x : nn.InstanceNorm2d(x)
 
         blocks = []
+        input_nc = nc + self.num_classes
         if self.imsize==128:
             blocks += [
                 # input is (nc) x 128 x 128
@@ -33,18 +34,18 @@ class Discriminator(nn.Module):
         elif self.imsize==64:
             blocks += [
                 # input is (nc) x 64 x 64
-                SN(nn.Conv2d(nc+self.num_classes, ndf, 4, 2, 1, bias=False)),
+                nn.Conv2d(input_nc, ndf, 4, 2, 1, bias=False),
                 nn.LeakyReLU(0.2, inplace=True),
                 # state size. (ndf) x 32 x 32
-                SN(nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False)),
+                nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False),
                 #nn.BatchNorm2d(ndf * 2),
-                IN(ndf * 2),
+                # IN(ndf * 2),
                 nn.LeakyReLU(0.2, inplace=True),
             ]
         else:
             blocks += [
                 # input is (nc) x 32 x 32
-                nn.Conv2d(nc+self.num_classes, ndf * 2, 4, 2, 1, bias=False),
+                nn.Conv2d(input_nc, ndf * 2, 4, 2, 1, bias=False),
                 nn.BatchNorm2d(ndf * 2),
                 # IN(ndf * 2),
                 nn.LeakyReLU(0.2, inplace=True),
@@ -88,11 +89,8 @@ class Discriminator(nn.Module):
         input = input[:, :self.nc]
         input = input.view(-1, self.imsize, self.imsize, self.nc).permute(0, 3, 1, 2)  # (BxN_samples)xC -> BxCxHxW
 
-        first_label = label[:,0]
-        first_label = first_label.long().to(input.device)
-        batch_size = first_label.size(0)
-        one_hot = torch.zeros(batch_size, self.num_classes, device=first_label.device)
-        one_hot.scatter_(1, first_label.unsqueeze(1), 1)
+        first_label = label[:, 0].long().to(input.device)
+        one_hot = F.one_hot(first_label, num_classes=self.num_classes).float()
         one_hot_expanded = one_hot.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.imsize, self.imsize)
 
         if self.hflip:      # Randomly flip input horizontally

@@ -1,6 +1,6 @@
-expname: column260108_0730
+expname: column260109_07_reg10
 data:
-  datadir: [data/RS307_n, data/RS330_n]
+  datadir: [data/RS307_n]
   far: 4.5
   fov: 20
   imsize: 256  
@@ -18,7 +18,7 @@ data:
   # v: 0.5, 0.36, 0.4, 0.3, 0.2, 0.16, 0.1
   v: 0.5, 0.4, 0.3, 0.2 
 discriminator:
-  num_classes: 2   
+  num_classes: 1   
   hflip: false
   ndf: 64 #64 #128
 nerf:
@@ -59,7 +59,7 @@ training:
   optimizer: rmsprop
   outdir: ./results
   print_every: 10
-  reg_param: 80.0
+  reg_param: 10.0
   restart_every: -1
   sample_every: 500
   save_best: fid
@@ -78,4 +78,4 @@ ccsr:
 wandb:
   project: graf260108
   entity: vicky20020808
-  name: RS0730_test
+  name: RS307_reg10_noccsr

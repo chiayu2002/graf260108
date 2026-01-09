@@ -1,8 +1,8 @@
 #!/bin/bash
-#PBS -l select=1:ncpus=1:gpu_id=1
+#PBS -l select=1:ncpus=1:gpu_id=2
 #PBS -l place=shared
-#PBS -o output260108_0730.txt				
-#PBS -e error260108_0730.txt				
+#PBS -o output260109_07_10.txt				
+#PBS -e error260109_07_10.txt				
 #PBS -N nerf
 cd ~/graf260108_im64										
 

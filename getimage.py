@@ -98,8 +98,8 @@ def create_horizontal_collage_from_two_dirs(dir1, dir2, selected_filenames1, sel
 # 使用示例
 if __name__ == "__main__":
     # 定義兩個目錄和相應的文件列表
-    dir1 = 'data/long/RS307'
-    dir2 = 'data/long/RS330'
+    dir1 = 'data/RS330_n'
+    dir2 = 'data/RS330_n'
     
     selected_images1 = ['0_0090.jpg', '0_0135.jpg', '0_0180.jpg', '0_0225.jpg']
     selected_images2 = ['0_0270.jpg', '0_0315.jpg', '0_0000.jpg', '0_0045.jpg']
