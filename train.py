@@ -155,6 +155,9 @@ def main():
     config['training']['lr_g'] = lr_g
     config['training']['lr_d'] = lr_d
 
+    lambda_cls_d = 1.0
+    lambda_cls_g = 1.0
+
     while True:
         epoch_idx += 1
         for x_real, label in tqdm(train_loader, desc=f"Epoch {epoch_idx}"):
@@ -179,9 +182,11 @@ def main():
             z = zdist.sample((batch_size,))
             
             #real data
-            d_real, label_real = discriminator(rgbs, label)
-            dloss_real = compute_loss(d_real, 1)
-            # d_class_loss = criterion_cls(label_real, real_cls_labels)
+            d_real, label_real_pred = discriminator(rgbs, label)
+            real_target = torch.tensor(np.random.uniform(0.9, 1.0, d_real.shape), device=device, dtype=torch.float32)
+            dloss_real = torch.nn.BCEWithLogitsLoss()(d_real, real_target)
+            # dloss_real = compute_loss(d_real, 1)
+            d_class_loss = criterion_cls(label_real_pred, real_cls_labels)
             reg = reg_param * compute_grad2(d_real, rgbs).mean()
             
             #fake data
@@ -192,8 +197,8 @@ def main():
             d_fake, _ = discriminator(x_fake, label)
             dloss_fake = compute_loss(d_fake, 0)
 
-            # total_d_loss = dloss_real + dloss_fake + reg + d_class_loss 
-            total_d_loss = dloss_real + dloss_fake + reg
+            total_d_loss = dloss_real + dloss_fake + reg + (d_class_loss * lambda_cls_d)
+            # total_d_loss = dloss_real + dloss_fake + reg
             total_d_loss.backward()
             d_optimizer.step()
             d_scheduler.step()
@@ -211,13 +216,13 @@ def main():
             z = zdist.sample((batch_size,))
             x_fake, _= generator(z, label)
             # x_fake, _, ccsr_output = generator(z, label, return_ccsr_output=True)
-            d_fake, label_fake = discriminator(x_fake, label)
+            d_fake, label_fake_pred = discriminator(x_fake, label)
 
             gloss = compute_loss(d_fake, 1)
-            # g_class_loss = criterion_cls(label_fake, real_cls_labels) 
+            g_class_loss = criterion_cls(label_fake_pred, real_cls_labels) 
             # ccsr_consistency_loss = ccsr_nerf_loss(ccsr_output, x_fake)
-            # gloss_all = gloss  + g_class_loss #+ ccsr_consistency_loss
-            gloss_all = gloss   #+ ccsr_consistency_loss
+            gloss_all = gloss  + (g_class_loss * lambda_cls_g) #+ ccsr_consistency_loss
+            # gloss_all = gloss   #+ ccsr_consistency_loss
 
             gloss_all.backward()
             g_optimizer.step()
@@ -229,11 +234,11 @@ def main():
             if (it + 1) % config['training']['print_every'] == 0:
                 wandb.log({
                     "loss/generator": gloss,
-                    # "loss/glabel": g_class_loss,
+                    "loss/glabel": g_class_loss,
                     # "loss/ccsr_consistency": ccsr_consistency_loss,
                     "loss/generator_total": gloss_all,
                     "loss/discriminator": total_d_loss,
-                    # "loss/dlabel": d_class_loss,
+                    "loss/dlabel": d_class_loss,
                     "loss/regularizer": reg,
                     "learning rate/generator": current_lr_g,
                     "learning rate/discriminator": current_lr_d,

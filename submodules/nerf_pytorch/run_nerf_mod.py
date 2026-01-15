@@ -26,14 +26,21 @@ def batchify(fn, chunk):
     if chunk is None:
         return fn
     def ret(inputs, label):
-        label_oftype = label[:,0]
-        return torch.cat([fn(inputs[i:i+chunk], label_oftype) for i in range(0, inputs.shape[0], chunk)], 0)
+        # label_oftype = label[:,0]
+        return torch.cat([fn(inputs[i:i+chunk], label[i:i+chunk]) for i in range(0, inputs.shape[0], chunk)], 0)
     return ret
 
 
 def run_network(inputs, viewdirs, fn, label, embed_fn, embeddirs_fn, features=None, netchunk=1024*64):   #輸出rgb and sigma
     inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]]) #524288 3
     embedded = embed_fn(inputs_flat)
+
+    class_labels = label[:, 0].long()
+    num_total_points = inputs_flat.shape[0]
+    batch_size = class_labels.shape[0]
+    points_per_batch = num_total_points // batch_size
+    class_labels_expanded = class_labels.repeat_interleave(points_per_batch)
+
     #print(f"0embedded.shape: {embedded.shape}") 524288 63
     if features is not None:
         # expand features to shape of flattened inputs  524288 256
@@ -55,7 +62,7 @@ def run_network(inputs, viewdirs, fn, label, embed_fn, embeddirs_fn, features=No
         #     features_appearance = features_appearance[:embedded.shape[0], :]
         #     embedded = torch.cat([embedded, features_appearance], dim=-1)
 
-    outputs_flat = batchify(fn, netchunk)(embedded, label)
+    outputs_flat = batchify(fn, netchunk)(embedded, class_labels_expanded)
     outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])  #8192 64 4
     return outputs
 

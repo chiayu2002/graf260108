@@ -112,8 +112,8 @@ class NeRF(nn.Module):
 
         label = label.long().to(input_pts.device)
         label_embedding = self.condition_embedding(label)
-        repeat_times = h.shape[0] // label_embedding.shape[0]
-        label_embedding = label_embedding.repeat(repeat_times, 1)
+        # repeat_times = h.shape[0] // label_embedding.shape[0]
+        # label_embedding = label_embedding.repeat(repeat_times, 1)
 
         input_o, input_shape = torch.split(input_pts, [63, 256], dim=-1)
         conditioned_shape = input_shape * label_embedding
