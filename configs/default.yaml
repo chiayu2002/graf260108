@@ -1,4 +1,4 @@
-expname: column260114_0730_reg10_acgan_real_target_hflip
+expname: column260119_0730_reg10_acgan_real_target_modnerf_inputlabel10_7class_skip3_BCE_lr3
 data:
   datadir: [data/RS307_n, data/RS330_n]
   far: 4.5
@@ -18,7 +18,7 @@ data:
   # v: 0.5, 0.36, 0.4, 0.3, 0.2, 0.16, 0.1
   v: 0.5, 0.4, 0.3, 0.2 
 discriminator:
-  num_classes: 2   
+  num_classes: 7   
   hflip: false
   ndf: 64 #64 #128
 nerf:
@@ -50,7 +50,7 @@ training:
   lr_anneal: 0.5
   lr_anneal_every: 80000,120000,150000
   lr_d: 0.0001
-  lr_g: 0.0006
+  lr_g: 0.0003
   model_average_beta: 0.999
   model_average_reinit: false
   model_file: model.pt
@@ -78,4 +78,4 @@ ccsr:
 wandb:
   project: graf260108
   entity: vicky20020808
-  name: RS0730_reg10_noccsr_acgan_real_target_hflip
+  name: RS0730_reg10_acgan_real_target_modnerf_inputlabel10_7class_skip3_BCE_lr3

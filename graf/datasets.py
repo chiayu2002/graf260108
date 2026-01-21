@@ -26,26 +26,60 @@ class ImageDataset(VisionDataset):
         root = []
         self.labels = {}
 
-        category_map = {
-            "0_": 0,  
-            "0.5_": 1, 
-            # "0.7_": 2, 
-            "1_": 2, 
-            "1.5_": 3,
-            # "1.7_": 5, 
-            # "2_": 6,    
+        self.height_map = {
+            "0_": 0,    
+            "0.5_": 1,  
+            "1_": 2,    
+            "1.5_": 3,  
         }
-        for dir_idx, ddir in enumerate(self.root):
-            filenames = self._get_files(ddir)
-            self.filenames.extend(filenames)
 
-            for filename in filenames:
-                for category_prefix, category_idx in category_map.items():
+        target_specimens = ["RS307_n", "RS330_n"] #, "RS615_n"
+        self.specimen_props = {
+            "RS307_n": {
+                "AR": [1, 0],       # 3.0
+                "TR": [1, 0, 0],    # 0.742
+                "LR": [0, 1]        # 1.282
+            },
+            "RS330_n": {
+                "AR": [1, 0],       # 3.0
+                "TR": [0, 0, 1],    # 2.889
+                "LR": [1, 0]        # 1.106
+            }
+            # "RS615_n": {
+            #     "AR": [0, 1],       # 6.0
+            #     "TR": [0, 1, 0],    # 1.444
+            #     "LR": [1, 0]        # 1.106
+            # }
+        }
+        for ddir in data_dirs:
+            all_files = self._get_files(ddir)
+            
+            for filename in all_files:
+                # [篩選] 只保留 RS307 和 RS330
+                specimen_name = None
+                for name in target_specimens:
+                    if name in filename:
+                        specimen_name = name
+                        break
+                
+                if specimen_name is None:
+                    continue 
+
+                self.filenames.append(filename)
+
+                props = self.specimen_props[specimen_name]
+                vec_AR = props["AR"]
+                vec_TR = props["TR"]
+                vec_LR = props["LR"]
+
+                for category_prefix, category_idx in self.height_map.items():
                     if filename.startswith(f"{ddir}/{category_prefix}"):
                         # file_idx = int(filename.split('/')[-1].replace(category_prefix, "").replace('.jpg', '').lstrip('0'))
                         num_part = filename.split('_')[-1].replace('.jpg', '')
                         file_idx = int(num_part)
-                        self.labels[filename] = [dir_idx, category_idx, file_idx]
+                        angle_idx = [category_idx, file_idx]
+                        final_label = vec_AR + vec_TR + vec_LR + angle_idx
+                        self.labels[filename] = final_label
                         break 
             root.append(ddir)
         # for dir_idx, ddir in enumerate(self.root):

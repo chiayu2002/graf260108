@@ -22,7 +22,7 @@ from graf.transforms import ImgToPatch
  
 from GAN_stability.gan_training.checkpoints_mod import CheckpointIO
 
-# os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+# os.environ['CUDA_VISIBLE_DEVICES'] = '4'
 
 def setup_directories(config):
     out_dir = os.path.join(config['training']['outdir'], config['expname'])
@@ -34,6 +34,17 @@ def setup_directories(config):
 def initialize_training(config, device):
     # dataset
     train_dataset, hwfr= get_data(config)
+
+    # print("=== Label Check ===")
+    # print(f"Total images: {len(train_dataset)}")
+    # # 隨機印出 10 個檔案的 Label
+    # import random
+    # for _ in range(10):
+    #     idx = random.randint(0, len(train_dataset)-1)
+    #     img, lbl = train_dataset[idx]
+    #     print(f"File: {train_dataset.filenames[idx]}, Label: {lbl}")
+    # print("===================")
+
     if config['data']['orthographic']:
         hw_ortho = (config['data']['far']-config['data']['near'],) * 2
         hwfr[2] = hw_ortho
@@ -156,15 +167,16 @@ def main():
     config['training']['lr_d'] = lr_d
 
     lambda_cls_d = 1.0
-    lambda_cls_g = 1.0
+    lambda_cls_g = 0.05
 
     while True:
         epoch_idx += 1
         for x_real, label in tqdm(train_loader, desc=f"Epoch {epoch_idx}"):
             it += 1
 
-            criterion_cls = torch.nn.CrossEntropyLoss().to(device)
-            real_cls_labels = label[:, 0].long().to(device)
+            # criterion_cls = torch.nn.CrossEntropyLoss().to(device)
+            criterion_cls = torch.nn.BCEWithLogitsLoss().to(device)
+            real_cls_labels = label[:, :7].float().to(device)
 
             generator.ray_sampler.iterations = it
             toggle_grad(generator, False)
@@ -257,7 +269,17 @@ def main():
                 plist = []
                 angle_positions = [(i/8, 0.5) for i in range(8)] 
                 ztest = zdist.sample((batch_size,))
-                label_test = torch.tensor([[0] if i < 4 else [0] for i in range(batch_size)])
+                # label_test = torch.tensor([[0] if i < 4 else [0] for i in range(batch_size)])
+
+                vec_307 = [1.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0,  0.5, 0.0]
+                vec_330 = [1.0, 0.0,  0.0, 0.0, 1.0,  1.0, 0.0,  0.5, 0.0]
+                test_labels_list = []
+                for i in range(batch_size):
+                    if i < batch_size // 2:
+                        test_labels_list.append(vec_307)
+                    else:
+                        test_labels_list.append(vec_307)
+                label_test = torch.tensor(test_labels_list, dtype=torch.float32).to(device)
 
                 # save_dir = os.path.join(out_dir, 'poses')
                 # os.makedirs(save_dir, exist_ok=True)

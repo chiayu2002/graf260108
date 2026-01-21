@@ -26,17 +26,17 @@ from graf.transforms import ImgToPatch
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 
-checkpoint_path = '/Data/home/vicky/graf250916/results/column250923_72/chkpts/model_00039999.pt'
+checkpoint_path = '/Data/home/vicky/graf260108_im64/results/column260119_0730_reg10_acgan_real_target_modnerf_inputlabel10_7class_skip3_BCE_lr3/chkpts/model_00049999.pt'
 
 if __name__ == '__main__':
     # Arguments
     parser = argparse.ArgumentParser(
         description='Train a GAN with different regularization strategies.'
     )
-    parser.add_argument('--config', default='/Data/home/vicky/graf250916/results/column250923_72/config.yaml', type=str, help='Path to config file.')
+    parser.add_argument('--config', default='/Data/home/vicky/graf260108_im64/results/column260119_0730_reg10_acgan_real_target_modnerf_inputlabel10_7class_skip3_BCE_lr3/config.yaml', type=str, help='Path to config file.')
     parser.add_argument('--fid_kid', action='store_true', help='Evaluate FID and KID.')
-    parser.add_argument('--create_sample', help='Generate videos with changing camera pose.')
-    parser.add_argument('--rotation_elevation', default= True, action='store_true', help='Generate videos with changing camera pose.')
+    parser.add_argument('--create_sample', default= True, help='Generate videos with changing camera pose.')
+    parser.add_argument('--rotation_elevation', action='store_true', help='Generate videos with changing camera pose.')
     parser.add_argument('--shape_appearance', action='store_true', help='Create grid image showing shape/appearance variation.')
     parser.add_argument('--pretrained', action='store_true', help='Load pretrained model.')
 
@@ -132,17 +132,24 @@ if __name__ == '__main__':
         # original_positions = [(0.15, 0.24),(0.29, 0.24), (0.56, 0.24), (0.71, 0.24), (0.82, 0.47), 
         #   (0.82, 0.38), (0.82, 0.22),(0.82, 0.14)]
         # angle_positions = [(u+0.75 , v) for u, v in original_positions] 
-        angle_positions= [(i/8, 0.5) for i in range(8)] 
-        label = create_labels(N_samples, 0)
+        angle_positions= [(i/8+0.25, 0.5) for i in range(8)] 
+        # label = create_labels(N_samples, 1)
 
         z = zdist.sample((N_samples,))
+
+        vec_307 = [1.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0,  0.5, 0.0]
+        vec_330 = [1.0, 0.0,  0.0, 0.0, 1.0,  1.0, 0.0,  0.5, 0.0]
+        # test_labels_list = []
+        # test_labels_list.append(vec_307)
+        test_labels_tensor = torch.tensor([vec_307] * N_samples, dtype=torch.float32).to(device)
+
         all_rgb = []
         for i, (u, v) in enumerate(angle_positions):
             # position_angle = (azimuth + 180) % 360
             print(f"處理角度位置 {i}: ({u}, {v})")
             poses = generator.sample_select_pose(u ,v)
             # print(poses)
-            rgb, depth, acc = evaluator.create_samples(z.to(device)[i:i+1], label[i:i+1], poses.unsqueeze(0))
+            rgb, depth, acc = evaluator.create_samples(z.to(device)[i:i+1], test_labels_tensor[i:i+1], poses.unsqueeze(0))
             all_rgb.append(rgb)
 
         rgb = torch.cat(all_rgb, dim=0)
@@ -155,7 +162,7 @@ if __name__ == '__main__':
 
     if args.rotation_elevation:
         N_samples = 1
-        N_poses = 150            # corresponds to number of frames
+        N_poses = 180            # corresponds to number of frames
         render_radius = config['data']['radius']
         if isinstance(render_radius, str):  # use maximum radius
             render_radius = float(render_radius.split(',')[1])
@@ -174,7 +181,7 @@ if __name__ == '__main__':
             return {'rotation': render_poses_rotation}
 
         z = zdist.sample((N_samples,))
-        label = create_labels(N_samples, 0)
+        label = create_labels(N_samples, 1)
 
         for name, poses in get_render_poses_rotation_elevation(N_poses).items():
             outpath = os.path.join(eval_dir, '{}/'.format(name))

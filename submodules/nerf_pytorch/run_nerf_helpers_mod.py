@@ -87,10 +87,10 @@ class NeRF(nn.Module):
         # self.views_linears = nn.ModuleList(
         #     [nn.Linear(input_ch_views + W, W//2)] + [nn.Linear(W//2, W//2) for i in range(D//2)])
         
-        self.condition_embedding = nn.Sequential(
-                nn.Embedding(numclasses, W),
-                nn.LayerNorm(W)
-                )
+        # self.condition_embedding = nn.Sequential(
+        #         nn.Embedding(numclasses, W),
+        #         nn.LayerNorm(W)
+        #         )
         # self.condition_embedding = nn.Sequential(
         #         nn.Embedding(numclasses, W),
         #         nn.LayerNorm(W),
@@ -98,6 +98,13 @@ class NeRF(nn.Module):
         #         nn.ReLU(), 
         #         nn.LayerNorm(W)
         #         )
+
+        self.condition_embedding = nn.Sequential(
+                nn.Linear(numclasses, W), 
+                nn.LayerNorm(W),
+                nn.ReLU(), # 建議加 ReLU
+                nn.Linear(W, W)
+                )
             
         if use_viewdirs:
             self.feature_linear = nn.Linear(W, W)
@@ -110,19 +117,20 @@ class NeRF(nn.Module):
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1) #torch.Size([65536, 319]),torch.Size([65536, 27])
         h = input_pts
 
-        label = label.long().to(input_pts.device)
+        label = label.to(input_pts.device)
         label_embedding = self.condition_embedding(label)
         # repeat_times = h.shape[0] // label_embedding.shape[0]
         # label_embedding = label_embedding.repeat(repeat_times, 1)
 
         input_o, input_shape = torch.split(input_pts, [63, 256], dim=-1)
         conditioned_shape = input_shape * label_embedding
-        h = torch.cat([input_o, conditioned_shape],dim=-1)
+        conditioned_input = torch.cat([input_o, conditioned_shape], dim=-1)
+        h = conditioned_input
         for i, l in enumerate(self.pts_linears):
             h = self.pts_linears[i](h)
             h = relu(h)
             if i in self.skips:
-                h = torch.cat([h, input_pts], -1)
+                h = torch.cat([h, conditioned_input], -1)
 
         if self.use_viewdirs:
             alpha = self.alpha_linear(h)

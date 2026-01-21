@@ -15,7 +15,7 @@ class Discriminator(nn.Module):
         IN = lambda x : nn.InstanceNorm2d(x)
 
         blocks = []
-        input_nc = nc #+ self.num_classes
+        input_nc = nc + num_classes
         if self.imsize==128:
             blocks += [
                 # input is (nc) x 128 x 128
@@ -35,13 +35,27 @@ class Discriminator(nn.Module):
             blocks += [
                 # input is (nc) x 64 x 64
                 nn.Conv2d(input_nc, ndf, 4, 2, 1, bias=False),
+                nn.BatchNorm2d(ndf),
                 nn.LeakyReLU(0.2, inplace=True),
                 # state size. (ndf) x 32 x 32
                 nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False),
-                #nn.BatchNorm2d(ndf * 2),
+                nn.BatchNorm2d(ndf * 2),
                 # IN(ndf * 2),
                 nn.LeakyReLU(0.2, inplace=True),
             ]
+            # first_out_channels = ndf
+            # # 針對 64x64 的第一層
+            # self.first_block = nn.Sequential(
+            #     nn.Conv2d(input_nc, first_out_channels, 4, 2, 1, bias=False),
+            #     nn.BatchNorm2d(first_out_channels),
+            #     nn.LeakyReLU(0.2, inplace=True)
+            # )
+            # # 剩下的區塊
+            # blocks += [
+            #     nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False),
+            #     nn.BatchNorm2d(ndf * 2),
+            #     nn.LeakyReLU(0.2, inplace=True),
+            # ]
         else:
             blocks += [
                 # input is (nc) x 32 x 32
@@ -66,6 +80,8 @@ class Discriminator(nn.Module):
             # SN(nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False)),
             # nn.Sigmoid()
         ]
+
+        # self.embed = nn.Embedding(num_classes, first_out_channels)
         self.conv_out = nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False)
         blocks = [x for x in blocks if x]
         self.main = nn.Sequential(*blocks)
@@ -76,6 +92,7 @@ class Discriminator(nn.Module):
         #     nn.LeakyReLU(0.2, inplace=True),
         #     nn.Conv2d(128, self.num_classes, 1, bias=False)
         # )
+        # self.label_embedding = nn.Linear(num_classes, nc)
 
         self.label_out = nn.Sequential(
             nn.Conv2d(ndf * 8, 256, 1, bias=False),  
@@ -89,17 +106,20 @@ class Discriminator(nn.Module):
         input = input[:, :self.nc]
         input = input.view(-1, self.imsize, self.imsize, self.nc).permute(0, 3, 1, 2)  # (BxN_samples)xC -> BxCxHxW
 
-        # first_label = label[:, 0].long().to(input.device)
+        first_label = label[:, :self.num_classes].float().to(input.device)
         # one_hot = F.one_hot(first_label, num_classes=self.num_classes).float()
         # one_hot_expanded = one_hot.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.imsize, self.imsize)
+        # label_feature = self.label_embedding(first_label)
+        # label_map = label_feature.view(label_feature.size(0), self.nc, 1, 1).expand(-1, -1, input.size(2), input.size(3))
+        label_map = first_label.view(first_label.size(0), self.num_classes, 1, 1).expand(-1, -1, input.size(2), input.size(3))
 
         if self.hflip:      # Randomly flip input horizontally
             input_flipped = input.flip(3)
             mask = torch.randint(0, 2, (len(input),1, 1, 1)).bool().expand(-1, *input.shape[1:])
             input = torch.where(mask, input, input_flipped)
-        # labelinput = torch.cat([input, one_hot_expanded], 1)
-        # features = self.main(labelinput)
-        features = self.main(input)
+        labelinput = torch.cat([input, label_map], 1)
+        features = self.main(labelinput)
+        # features = self.main(input)
         out = self.conv_out(features)
 
         # final_output = out[:, :1]

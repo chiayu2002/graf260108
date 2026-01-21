@@ -35,11 +35,11 @@ def run_network(inputs, viewdirs, fn, label, embed_fn, embeddirs_fn, features=No
     inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]]) #524288 3
     embedded = embed_fn(inputs_flat)
 
-    class_labels = label[:, 0].long()
+    class_labels = label[:, :7]
     num_total_points = inputs_flat.shape[0]
     batch_size = class_labels.shape[0]
     points_per_batch = num_total_points // batch_size
-    class_labels_expanded = class_labels.repeat_interleave(points_per_batch)
+    class_labels_expanded = class_labels.repeat_interleave(points_per_batch, dim=0).float()
 
     #print(f"0embedded.shape: {embedded.shape}") 524288 63
     if features is not None:
@@ -150,7 +150,7 @@ def create_nerf(args):
         embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
     # input_ch_views += args.feat_dim_appearance
     output_ch = 5 if args.N_importance > 0 else 4
-    skips = [4]
+    skips = [3]
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
                  input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs, numclasses=args.num_class)

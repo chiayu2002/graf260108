@@ -70,8 +70,8 @@ class Generator(object):
                 v_list = [float(x.strip()) for x in self.v.split(",")]
 
                 for i in range(label.size(0)):
-                    second_value = label[i, 1].item()
-                    index = int(label[i, 2].item())  # 得到第3個值
+                    second_value = label[i, 7].item()
+                    index = int(label[i, 8].item())  # 得到第3個值
 
                     # 基礎 u v值計算
                     selected_u = index / 360
