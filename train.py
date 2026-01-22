@@ -166,8 +166,10 @@ def main():
     config['training']['lr_g'] = lr_g
     config['training']['lr_d'] = lr_d
 
+    n_each_task = [2, 3, 2] 
+    criterion_cls = MCE_Loss().to(device)
     lambda_cls_d = 1.0
-    lambda_cls_g = 0.05
+    lambda_cls_g = 5.0
 
     while True:
         epoch_idx += 1
@@ -175,7 +177,7 @@ def main():
             it += 1
 
             # criterion_cls = torch.nn.CrossEntropyLoss().to(device)
-            criterion_cls = torch.nn.BCEWithLogitsLoss().to(device)
+            # criterion_cls = torch.nn.BCEWithLogitsLoss().to(device)
             real_cls_labels = label[:, :7].float().to(device)
 
             generator.ray_sampler.iterations = it
@@ -198,7 +200,8 @@ def main():
             real_target = torch.tensor(np.random.uniform(0.9, 1.0, d_real.shape), device=device, dtype=torch.float32)
             dloss_real = torch.nn.BCEWithLogitsLoss()(d_real, real_target)
             # dloss_real = compute_loss(d_real, 1)
-            d_class_loss = criterion_cls(label_real_pred, real_cls_labels)
+            # d_class_loss = criterion_cls(label_real_pred, real_cls_labels)
+            d_class_loss = criterion_cls(n_each_task, label_real_pred, real_cls_labels)
             reg = reg_param * compute_grad2(d_real, rgbs).mean()
             
             #fake data
@@ -231,7 +234,8 @@ def main():
             d_fake, label_fake_pred = discriminator(x_fake, label)
 
             gloss = compute_loss(d_fake, 1)
-            g_class_loss = criterion_cls(label_fake_pred, real_cls_labels) 
+            # g_class_loss = criterion_cls(label_fake_pred, real_cls_labels) 
+            g_class_loss = criterion_cls(n_each_task, label_fake_pred, real_cls_labels)
             # ccsr_consistency_loss = ccsr_nerf_loss(ccsr_output, x_fake)
             gloss_all = gloss  + (g_class_loss * lambda_cls_g) #+ ccsr_consistency_loss
             # gloss_all = gloss   #+ ccsr_consistency_loss
@@ -271,8 +275,8 @@ def main():
                 ztest = zdist.sample((batch_size,))
                 # label_test = torch.tensor([[0] if i < 4 else [0] for i in range(batch_size)])
 
-                vec_307 = [1.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0,  0.5, 0.0]
-                vec_330 = [1.0, 0.0,  0.0, 0.0, 1.0,  1.0, 0.0,  0.5, 0.0]
+                vec_307 = [1.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0]
+                vec_330 = [1.0, 0.0,  0.0, 0.0, 1.0,  1.0, 0.0]
                 test_labels_list = []
                 for i in range(batch_size):
                     if i < batch_size // 2:

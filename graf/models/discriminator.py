@@ -15,7 +15,7 @@ class Discriminator(nn.Module):
         IN = lambda x : nn.InstanceNorm2d(x)
 
         blocks = []
-        input_nc = nc + num_classes
+        input_nc = nc #+ num_classes
         if self.imsize==128:
             blocks += [
                 # input is (nc) x 128 x 128
@@ -106,19 +106,19 @@ class Discriminator(nn.Module):
         input = input[:, :self.nc]
         input = input.view(-1, self.imsize, self.imsize, self.nc).permute(0, 3, 1, 2)  # (BxN_samples)xC -> BxCxHxW
 
-        first_label = label[:, :self.num_classes].float().to(input.device)
+        # first_label = label[:, :self.num_classes].float().to(input.device)
         # one_hot = F.one_hot(first_label, num_classes=self.num_classes).float()
         # one_hot_expanded = one_hot.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.imsize, self.imsize)
         # label_feature = self.label_embedding(first_label)
         # label_map = label_feature.view(label_feature.size(0), self.nc, 1, 1).expand(-1, -1, input.size(2), input.size(3))
-        label_map = first_label.view(first_label.size(0), self.num_classes, 1, 1).expand(-1, -1, input.size(2), input.size(3))
+        # label_map = first_label.view(first_label.size(0), self.num_classes, 1, 1).expand(-1, -1, input.size(2), input.size(3))
 
         if self.hflip:      # Randomly flip input horizontally
             input_flipped = input.flip(3)
             mask = torch.randint(0, 2, (len(input),1, 1, 1)).bool().expand(-1, *input.shape[1:])
             input = torch.where(mask, input, input_flipped)
-        labelinput = torch.cat([input, label_map], 1)
-        features = self.main(labelinput)
+        # labelinput = torch.cat([input, label_map], 1)
+        features = self.main(input)
         # features = self.main(input)
         out = self.conv_out(features)
 

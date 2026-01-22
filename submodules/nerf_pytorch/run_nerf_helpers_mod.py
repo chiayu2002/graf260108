@@ -108,8 +108,8 @@ class NeRF(nn.Module):
             
         if use_viewdirs:
             self.feature_linear = nn.Linear(W, W)
-            self.alpha_linear = nn.Linear(W, 1)
-            self.rgb_linear = nn.Linear(W//2, 3)
+            self.alpha_linear = nn.Linear(W, numclasses*1)  #numclasses*
+            self.rgb_linear = nn.Linear(W//2, numclasses*3)
         else:
             self.output_linear = nn.Linear(W, output_ch)
 
@@ -118,6 +118,7 @@ class NeRF(nn.Module):
         h = input_pts
 
         label = label.to(input_pts.device)
+        class_idx = label.argmax(dim=-1).long()
         label_embedding = self.condition_embedding(label)
         # repeat_times = h.shape[0] // label_embedding.shape[0]
         # label_embedding = label_embedding.repeat(repeat_times, 1)
@@ -133,7 +134,9 @@ class NeRF(nn.Module):
                 h = torch.cat([h, conditioned_input], -1)
 
         if self.use_viewdirs:
-            alpha = self.alpha_linear(h)
+            # alpha = self.alpha_linear(h)
+            all_alphas = self.alpha_linear(h)
+            alpha = all_alphas.gather(1, class_idx.unsqueeze(1))
             feature = self.feature_linear(h)
             # input_d, input_shape = torch.split(input_views, [27, 256], dim=-1)
             # conditioned_shape = input_shape * label_embedding
@@ -147,7 +150,12 @@ class NeRF(nn.Module):
                 h = self.views_linears[i](h)
                 h = relu(h)
 
-            rgb = self.rgb_linear(h)
+            # rgb = self.rgb_linear(h)
+            all_rgbs = self.rgb_linear(h)
+            all_rgbs = all_rgbs.view(-1, self.numclasses, 3)
+            # 擴展索引以匹配 RGB 的 3 個通道
+            idx_expanded = class_idx.unsqueeze(1).unsqueeze(2).expand(-1, 1, 3)
+            rgb = all_rgbs.gather(1, idx_expanded).squeeze(1)
             outputs = torch.cat([rgb, alpha], -1)
         else:
             outputs = self.output_linear(h)
