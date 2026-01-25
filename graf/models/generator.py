@@ -88,7 +88,8 @@ class Generator(object):
         render_kwargs = dict(render_kwargs)        # copy
 
         render_kwargs['features'] = z
-        rgb, disp, acc, extras = render(self.H, self.W, self.focal, label, chunk=self.chunk, rays=rays,
+        label_input = label[:, :7]
+        rgb, disp, acc, extras = render(self.H, self.W, self.focal, label_input, chunk=self.chunk, rays=rays,
                                         **render_kwargs)
 
         rays_to_output = lambda x: x.view(len(x), -1) * 2 - 1      # (BxN_samples)xC

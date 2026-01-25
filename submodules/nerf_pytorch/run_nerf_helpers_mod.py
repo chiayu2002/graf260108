@@ -118,8 +118,17 @@ class NeRF(nn.Module):
         h = input_pts
 
         label = label.to(input_pts.device)
-        class_idx = label.argmax(dim=-1).long()
-        label_embedding = self.condition_embedding(label)
+
+        # 1. 解碼各個屬性 (找出它是該屬性的第幾類)
+        ar_idx = label[:, :2].argmax(dim=-1)   # AR 是第幾類?
+        tr_idx = label[:, 2:5].argmax(dim=-1)  # TR 是第幾類?
+        lr_idx = label[:, 5:7].argmax(dim=-1)  # LR 是第幾類?
+        class_idx = ar_idx * 6 + tr_idx * 2 + lr_idx
+        class_idx = class_idx.long()
+        # class_idx = label.argmax(dim=-1).long()
+        # label_embedding = self.condition_embedding(label)
+        label_onehot = F.one_hot(class_idx, num_classes=self.numclasses).float()
+        label_embedding = self.condition_embedding(label_onehot)
         # repeat_times = h.shape[0] // label_embedding.shape[0]
         # label_embedding = label_embedding.repeat(repeat_times, 1)
 

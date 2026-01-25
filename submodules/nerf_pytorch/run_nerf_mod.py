@@ -74,7 +74,7 @@ def batchify_rays(rays_flat, label, chunk=1024*32, **kwargs):  #批次render ray
     for i in range(0, rays_flat.shape[0], chunk):
         if features is not None:
             kwargs['features'] = features[i:i+chunk]
-        ret= render_rays(rays_flat[i:i+chunk],label,  **kwargs)
+        ret= render_rays(rays_flat[i:i+chunk],label[i:i+chunk],  **kwargs)
         for k in ret:
             if k not in all_ret:
                 all_ret[k] = []
@@ -118,6 +118,22 @@ def render(H, W, focal, label, chunk=1024*32, rays=None, c2w=None, ndc=True,
     near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1])
     rays = torch.cat([rays_o, rays_d, near, far], -1)
     #print("rays values:", rays) #torch.Size([8192, 8])
+
+    # --- [關鍵修正開始] ---
+    # 目前 label 形狀是 [Batch_Size, 7]
+    # rays 形狀是 [Batch_Size * N_rays_per_img, 11]
+    # 我們需要把 label 擴展成 [Batch_Size * N_rays_per_img, 7]
+    
+    bs = label.shape[0]        # Batch Size (例如 8)
+    n_total_rays = rays.shape[0] # 總射線數 (例如 8192)
+    rays_per_img = n_total_rays // bs # 每張圖的射線數 (例如 1024)
+    
+    # 1. 增加一個維度: [Batch, 1, 7]
+    # 2. 複製 rays_per_img 次: [Batch, Rays, 7]
+    # 3. 攤平: [Batch * Rays, 7]
+    label_per_ray = label.unsqueeze(1).repeat(1, rays_per_img, 1).view(-1, label.shape[-1])
+    # --- [關鍵修正結束] ---
+
     if use_viewdirs:
         rays = torch.cat([rays, viewdirs], -1) #torch.Size([8192, 11])
         #print("rays values:", rays)
@@ -129,7 +145,7 @@ def render(H, W, focal, label, chunk=1024*32, rays=None, c2w=None, ndc=True,
         kwargs['features'] = kwargs['features'].unsqueeze(1).expand(-1, N_rays, -1).flatten(0, 1)
 
     # Render and reshape
-    all_ret = batchify_rays(rays, label, chunk, **kwargs)
+    all_ret = batchify_rays(rays, label_per_ray, chunk, **kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = torch.reshape(all_ret[k], k_sh)
@@ -153,7 +169,7 @@ def create_nerf(args):
     skips = [3]
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
-                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs, numclasses=args.num_class)
+                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs, numclasses=args.num_class) #args.num_class
     grad_vars = list(model.parameters())
     named_params = list(model.named_parameters())
 

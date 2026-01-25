@@ -22,7 +22,7 @@ from graf.transforms import ImgToPatch
  
 from GAN_stability.gan_training.checkpoints_mod import CheckpointIO
 
-# os.environ['CUDA_VISIBLE_DEVICES'] = '4'
+# os.environ['CUDA_VISIBLE_DEVICES'] = '2'
 
 def setup_directories(config):
     out_dir = os.path.join(config['training']['outdir'], config['expname'])
@@ -169,7 +169,7 @@ def main():
     n_each_task = [2, 3, 2] 
     criterion_cls = MCE_Loss().to(device)
     lambda_cls_d = 1.0
-    lambda_cls_g = 5.0
+    lambda_cls_g = 1.0
 
     while True:
         epoch_idx += 1

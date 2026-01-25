@@ -1,4 +1,4 @@
-expname: column260122_0730_reg10_acgan_real_target_modnerf_7class_skip3_BCE_lr3_modnerffor_disnoinputlabel_MCE_glabel5
+expname: column260123_0730_reg10_7class_skip3_lr3_modnerffor_disnoinputlabel_MCE_nerf12class
 data:
   datadir: [data/RS307_n, data/RS330_n]
   far: 4.5
@@ -35,6 +35,7 @@ nerf:
   N_importance: 0
   netdepth_fine: 8
   netwidth_fine: 256
+  num_classes: 12
 ray_sampler:
   N_samples: 4096 #1024 #4096
   max_scale: 1.0
@@ -78,4 +79,4 @@ ccsr:
 wandb:
   project: graf260108
   entity: vicky20020808
-  name: RS0730_reg10_acgan_real_target_modnerf_7class_skip3_BCE_lr3_nerffor_disnoinputlabel_MCE_glabel5
+  name: RS0730_reg10_7class_skip3_lr3_nerffor_disnoinputlabel_MCE_nerf12class
