@@ -37,18 +37,18 @@ class ImageDataset(VisionDataset):
         self.specimen_props = {
             "RS307_n": {
                 "AR": [1, 0],       # 3.0
-                "TR": [1, 0, 0],    # 0.742
-                "LR": [0, 1]        # 1.282
+                "LR": [1, 0, 0],    # 0.742
+                "TR": [0, 1]        # 1.282
             },
             "RS330_n": {
                 "AR": [1, 0],       # 3.0
-                "TR": [0, 0, 1],    # 2.889
-                "LR": [1, 0]        # 1.106
+                "LR": [0, 0, 1],    # 2.889
+                "TR": [1, 0]        # 1.106
             }
             # "RS615_n": {
             #     "AR": [0, 1],       # 6.0
-            #     "TR": [0, 1, 0],    # 1.444
-            #     "LR": [1, 0]        # 1.106
+            #     "LR": [0, 1, 0],    # 1.444
+            #     "TR": [1, 0]        # 1.106
             # }
         }
         for ddir in data_dirs:
@@ -69,8 +69,8 @@ class ImageDataset(VisionDataset):
 
                 props = self.specimen_props[specimen_name]
                 vec_AR = props["AR"]
-                vec_TR = props["TR"]
                 vec_LR = props["LR"]
+                vec_TR = props["TR"]
 
                 for category_prefix, category_idx in self.height_map.items():
                     if filename.startswith(f"{ddir}/{category_prefix}"):
@@ -78,7 +78,7 @@ class ImageDataset(VisionDataset):
                         num_part = filename.split('_')[-1].replace('.jpg', '')
                         file_idx = int(num_part)
                         angle_idx = [category_idx, file_idx]
-                        final_label = vec_AR + vec_TR + vec_LR + angle_idx
+                        final_label = vec_AR + vec_LR + vec_TR + angle_idx
                         self.labels[filename] = final_label
                         break 
             root.append(ddir)
