@@ -44,8 +44,8 @@ class Generator(object):
         # 添加CCSR模組
         if self.use_ccsr:
             # 假設低分辨率圖像尺寸為原圖的1/4
-            lr_height, lr_width = H // 4, W // 4
-            self.ccsr = CCSR(num_views=num_views, lr_height=lr_height, lr_width=lr_width, scale_factor=4).to(device)
+            # lr_height, lr_width = H // 4, W // 4
+            self.ccsr = CCSR(num_views=num_views, scale_factor=1).to(device)
             self.module_dict['ccsr'] = self.ccsr
             
         for name, module in self.module_dict.items():
@@ -94,51 +94,47 @@ class Generator(object):
 
         rays_to_output = lambda x: x.view(len(x), -1) * 2 - 1      # (BxN_samples)xC
     
-        if self.use_test_kwargs:               # return all outputs
-            return rays_to_output(rgb), \
-                   rays_to_output(disp), \
-                   rays_to_output(acc), extras
+        # if self.use_test_kwargs:               # return all outputs
+        #     return rays_to_output(rgb), \
+        #            rays_to_output(disp), \
+        #            rays_to_output(acc), extras
 
-        rgb = rays_to_output(rgb)
+        rgb_nerf = rays_to_output(rgb)
+        disp_out = rays_to_output(disp)
+        acc_out = rays_to_output(acc)
 
         # 如果啟用CCSR並且需要返回CCSR輸出
         ccsr_output = None
         if self.use_ccsr and return_ccsr_output:
-            # 將NeRF輸出轉換為圖像格式進行CCSR處理
-            # 這裡需要根據您的patch採樣方式調整
-            total_elements = rgb.numel()
-            rgb_nerf = rgb.view(bs, total_elements // (bs * 3), 3)
-            nerf_images = rgb_nerf.view(bs, int(np.sqrt(rgb_nerf.shape[1])), int(np.sqrt(rgb_nerf.shape[1])), 3).permute(0, 3, 1, 2)
+            # 1. 將 NeRF 的 Patch 轉回圖像格式 (例如 64x64)
+            # 注意：現在不需要對 rgb 進行下採樣，直接將 NeRF 輸出作為 CCSR 的輸入
+            patch_size = int(np.sqrt(rgb.shape[0] // bs))
+            nerf_patch = rgb.view(bs, patch_size, patch_size, 3).permute(0, 3, 1, 2).contiguous()
             
-            # 生成低分辨率版本
-            patch_size = 64
-            lr_size = max(8, patch_size // 4)
-            lr_images = F.interpolate(nerf_images, size=(lr_size, lr_size), mode='bilinear', align_corners=False)
-            
-            # 對每個樣本應用CCSR
+            # 2. 獲取視角對應的 Latent Code
             ccsr_results = []
             for i in range(bs):
-                # 使用label中的信息確定視角索引
-                # view_idx = int(label[i, 2].item()) if label.shape[1] > 2 else i
-                angle_idx = int(label[i, 2].item())
-                # 將 360 個角度映射到 8 個視角
-                view_idx = (angle_idx * 8) // 360  # 0-7 的範圍
-                ccsr_result = self.ccsr(lr_images[i:i+1], view_idx)
-                # view_idx = 72
-                # ccsr_result = self.ccsr(lr_images[i:i+1], view_idx)
-                ccsr_results.append(ccsr_result)
+                angle_idx = int(label[i, 8].item())  # 根據您的標籤索引調整
+                view_idx = (angle_idx * self.ccsr.num_views) // 360
+                
+                # 3. 通過 CCSR 網路提升細節
+                # 注意：此處傳入的 nerf_patch[i:i+1] 是 LR 輸入
+                refined_sr = self.ccsr(nerf_patch[i:i+1], view_idx)
+                ccsr_results.append(refined_sr)
             
-            ccsr_combined  = torch.cat(ccsr_results, dim=0)
-            ccsr_resized = F.interpolate(ccsr_combined, size=(patch_size, patch_size), 
-                                       mode='bilinear', align_corners=False)
-            # 轉換為與NeRF輸出相同的格式
-            # ccsr_output = ccsr_resized.permute(0, 2, 3, 1).view(bs, -1, 3) * 2 - 1
+            ccsr_output = torch.cat(ccsr_results, dim=0)
 
-        if return_ccsr_output:
-            ccsr_output = ccsr_resized.permute(0, 2, 3, 1).contiguous().view(-1, 3)
-            return rgb, rays, ccsr_output
+        if self.use_test_kwargs:
+            # eval 模式：如果要求 CCSR 則多回傳一個，否則維持原樣回傳 4 個值
+            if return_ccsr_output:
+                return rgb_nerf, disp_out, acc_out, extras, ccsr_output
+            return rgb_nerf, disp_out, acc_out, extras
+
         else:
-            return rgb, rays
+            # train 模式
+            if return_ccsr_output:
+                return rgb_nerf, rays, ccsr_output
+            return rgb_nerf, rays
         
         # return rgb, rays
 

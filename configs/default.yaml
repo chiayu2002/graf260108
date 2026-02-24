@@ -1,6 +1,6 @@
-expname: column260123_0730_reg10_7class_skip3_lr3_modnerffor_disnoinputlabel_MCE_nerf12class
+expname: column260223_0730_disinputlabel_MCE_nerf12class_ccsr_tanh_latent_codes_modloss_resb_ccsrpatchloss50_faketarget
 data:
-  datadir: [data/RS307_n, data/RS330_n]
+  datadir: [data/RS307_n, data/RS330_n] #, data/RS315_n , data/RS615_n
   far: 4.5
   fov: 20
   imsize: 256  
@@ -73,10 +73,10 @@ z_dist:
 ccsr: 
     enabled: True,
     num_views: 8,
-    scale_factor: 4,
+    scale_factor: 1,
     alpha_init: 1.0,
     alpha_decay: 0.0001
 wandb:
   project: graf260108
   entity: vicky20020808
-  name: RS0730_reg10_7class_skip3_lr3_nerffor_disnoinputlabel_MCE_nerf12class
+  name: RS0730_disinputlabel_MCE_nerf12class_ccsr_tanh_latent_codes_modloss_resb_ccsrpatchloss10_faketarget

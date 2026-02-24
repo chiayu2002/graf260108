@@ -24,46 +24,58 @@ class MCE_Loss(nn.Module):
         
         return sum(loss)
 
-class CCSRNeRFLoss(nn.Module):
-    """CCSR與NeRF的聯合損失"""
-    
-    def __init__(self, alpha_init=1.0, alpha_decay=0.0001):
+class CCSRLoss(nn.Module):
+    def __init__(self, device='cuda:0'):
         super().__init__()
-        self.mse_loss = nn.MSELoss()
-        self.alpha_init = alpha_init
-        self.alpha_decay = alpha_decay
-        self.iteration = 0
-        
-    def forward(self, ccsr_output, nerf_output):
+        self.mse = nn.MSELoss()
+        # 加載預訓練 VGG 作為知覺損失提取器
+        vgg = models.vgg19(pretrained=True).features[:16].to(device).eval()
+        for p in vgg.parameters(): p.requires_grad = False
+        self.vgg = vgg
+
+    def forward(self, sr_patch, real_patch):
         """
-        計算CCSR輸出與NeRF輸出的MSE損失
-        
-        Args:
-            ccsr_output: CCSR生成的圖像 [B, N_samples, 3] 
-            nerf_output: NeRF渲染的圖像 [B, N_samples, 3]
+        sr_patch: CCSR 輸出的高品質 Patch [B, 3, H, W]
+        real_patch: 從資料集採樣的真實高品質 Patch [B, 3, H, W]
         """
-        # 動態調整權重
-        alpha = self.alpha_init * np.exp(-self.alpha_decay * self.iteration)
+        # 1. Pixel Loss (維持顏色正確)
+        l1_loss = F.l1_loss(sr_patch, real_patch)
+
+        # 將範圍從 [-1, 1] 映射到 [0, 1]
+        sr_patch_norm = (sr_patch + 1) / 2.0
+        real_patch_norm = (real_patch + 1) / 2.0
         
-        # 計算MSE損失
-        consistency_loss = self.mse_loss(ccsr_output, nerf_output.detach())
+        # 2. Perceptual Loss (提升細節紋理)
+        sr_feat = self.vgg(sr_patch_norm)
+        real_feat = self.vgg(real_patch_norm)
+        perceptual_loss = F.mse_loss(sr_feat, real_feat)
         
-        self.iteration += 1
-        return alpha * consistency_loss
+        # 3. 總和：知覺損失權重通常較大以降低 FID
+        return l1_loss + 0.01 * perceptual_loss
     
 
-def compute_loss(d_outs, target):
-
+def compute_loss(d_outs, target_value):
+    """
+    優化後的損失計算函數
+    支援標籤平滑 (Label Smoothing)：target_value 可以是 float 或 (min, max) tuple
+    """
     d_outs = [d_outs] if not isinstance(d_outs, list) else d_outs
     loss = 0
-    BCEWithLogitsLoss = nn.BCEWithLogitsLoss()
-
+    device = d_outs[0].device
+    
     for d_out in d_outs:
-        targets = d_out.new_full(size=d_out.size(), fill_value=target)
-        # loss += F.binary_cross_entropy_with_logits(d_out, targets)
-        loss += BCEWithLogitsLoss(d_out, targets)
-        # loss += (2*target - 1) * d_out.mean()
-        # floss = loss / len(d_outs)
+        # 檢查 target_value 是否為範圍 (例如 (0.9, 1.0) 或 (0.0, 0.1))
+        if isinstance(target_value, tuple):
+            low, high = target_value
+            # 產生與 d_out 形狀相同的隨機平滑標籤
+            targets = torch.empty_like(d_out).uniform_(low, high)
+        else:
+            # 傳統硬標籤或固定平滑標籤
+            targets = torch.full_like(d_out, target_value)
+        
+        # 使用 binary_cross_entropy_with_logits 更加簡潔，不需重複實例化 nn.Module
+        loss += F.binary_cross_entropy_with_logits(d_out, targets)
+        
     return loss / len(d_outs)
 
 

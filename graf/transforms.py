@@ -105,8 +105,28 @@ class FlexGridRaySampler(RaySampler):
 
     def sample_rays(self, H, W):
 
-        h = self.h.clone()
-        w = self.w.clone()
+        if self.scale_anneal>0:
+            k_iter = self.iterations // 1000 * 3
+            min_scale = max(self.min_scale, self.max_scale * exp(-k_iter*self.scale_anneal))
+            min_scale = min(0.9, min_scale)
+        else:
+            min_scale = self.min_scale
+
+        scale = 1
+        if self.random_scale:
+            scale = torch.Tensor(1).uniform_(min_scale, self.max_scale)
+            h = self.h * scale 
+            w = self.w * scale 
+
+        if self.random_shift:
+            max_offset = 1-scale.item()
+            h_offset = torch.Tensor(1).uniform_(0, max_offset) * (torch.randint(2,(1,)).float()-0.5)*2
+            w_offset = torch.Tensor(1).uniform_(0, max_offset) * (torch.randint(2,(1,)).float()-0.5)*2
+
+            h += h_offset
+            w += w_offset
+
+        self.scale = scale
 
         return torch.cat([h, w], dim=2) #torch.Size([32, 32, 2])
 

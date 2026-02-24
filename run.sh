@@ -1,8 +1,8 @@
 #!/bin/bash
 #PBS -l select=1:ncpus=1:gpu_id=2
 #PBS -l place=shared
-#PBS -o output260109_07_10.txt				
-#PBS -e error260109_07_10.txt				
+#PBS -o output260223_0730_disinputlabel_MCE_12class_ccsr_tanh_latent_codes_modloss_resb_ccsrpatchloss10_fake_target.txt				
+#PBS -e error260223_0730_disinputlabel_MCE_12calss_ccsr_tanh_latent_codes_modloss_resb_ccsrpatchloss10_fake_target.txt				
 #PBS -N nerf
 cd ~/graf260108_im64										
 

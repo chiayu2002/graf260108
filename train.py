@@ -16,13 +16,13 @@ sys.path.append('submodules')
 from graf.gan_training import Evaluator
 from graf.config import get_data, build_models, load_config, save_config, build_lr_scheduler
 from graf.utils import get_zdist
-from graf.train_step import compute_grad2, compute_loss, save_data, wgan_gp_reg, toggle_grad, MCE_Loss, CCSRNeRFLoss
+from graf.train_step import compute_grad2, compute_loss, save_data, wgan_gp_reg, toggle_grad, MCE_Loss, CCSRLoss
 from graf.transforms import ImgToPatch
 # from graf.models.vit_model import ViewConsistencyTransformer
  
 from GAN_stability.gan_training.checkpoints_mod import CheckpointIO
 
-# os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+# os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 
 def setup_directories(config):
     out_dir = os.path.join(config['training']['outdir'], config['expname'])
@@ -107,7 +107,7 @@ def main():
     # 初始化model
     train_loader, generator, discriminator = initialize_training(config, device) #, qhead, dhead 
 
-    # ccsr_nerf_loss = CCSRNeRFLoss().to(device)
+    ccsr_loss = CCSRLoss().to(device)
 
     file_path = os.path.join(out_dir, "model_architecture.txt")
     with open(file_path, 'w') as f:
@@ -197,8 +197,7 @@ def main():
             
             #real data
             d_real, label_real_pred = discriminator(rgbs, label)
-            real_target = torch.tensor(np.random.uniform(0.9, 1.0, d_real.shape), device=device, dtype=torch.float32)
-            dloss_real = torch.nn.BCEWithLogitsLoss()(d_real, real_target)
+            dloss_real = compute_loss(d_real, (0.9, 1.0))
             # dloss_real = compute_loss(d_real, 1)
             # d_class_loss = criterion_cls(label_real_pred, real_cls_labels)
             d_class_loss = criterion_cls(n_each_task, label_real_pred, real_cls_labels)
@@ -210,9 +209,22 @@ def main():
             x_fake.requires_grad_()
 
             d_fake, _ = discriminator(x_fake, label)
-            dloss_fake = compute_loss(d_fake, 0)
+            dloss_fake = compute_loss(d_fake, (0.0, 0.1))
 
-            total_d_loss = dloss_real + dloss_fake + reg + (d_class_loss * lambda_cls_d)
+            # 新增：針對 CCSR 輸出的判別 (Fake data from CCSR)
+            with torch.no_grad():
+                # 獲取 CCSR 提升後的 Patch [B, 3, 64, 64]
+                _, _, ccsr_output_d = generator(z, label, return_ccsr_output=True)
+            # 將 [B, 3, 64, 64] 轉回 Discriminator 期望的 [B*N, 3] 格式
+            # 注意：ccsr_output_d 需先轉置為 [B, 64, 64, 3] 再 reshape
+            ccsr_patch_for_d = ccsr_output_d.permute(0, 2, 3, 1).reshape(-1, 3)
+            ccsr_patch_for_d.requires_grad_()
+
+            d_ccsr, _ = discriminator(ccsr_patch_for_d, label)
+            dloss_ccsr = compute_loss(d_ccsr, (0.0, 0.1))
+
+            total_d_loss = dloss_real + (dloss_fake + dloss_ccsr) / 2 + reg + (d_class_loss * lambda_cls_d)
+            # total_d_loss = dloss_real + dloss_fake + reg + (d_class_loss * lambda_cls_d)
             # total_d_loss = dloss_real + dloss_fake + reg
             total_d_loss.backward()
             d_optimizer.step()
@@ -229,15 +241,23 @@ def main():
             g_optimizer.zero_grad()
 
             z = zdist.sample((batch_size,))
-            x_fake, _= generator(z, label)
-            # x_fake, _, ccsr_output = generator(z, label, return_ccsr_output=True)
+            # x_fake, _= generator(z, label)
+            x_fake, _, ccsr_output = generator(z, label, return_ccsr_output=True)
             d_fake, label_fake_pred = discriminator(x_fake, label)
-
             gloss = compute_loss(d_fake, 1)
+
+            ccsr_patch_for_g = ccsr_output.permute(0, 2, 3, 1).reshape(-1, 3)
+            d_ccsr_fake, _ = discriminator(ccsr_patch_for_g, label)
+            gloss_ccsr = compute_loss(d_ccsr_fake, 1)
+
             # g_class_loss = criterion_cls(label_fake_pred, real_cls_labels) 
             g_class_loss = criterion_cls(n_each_task, label_fake_pred, real_cls_labels)
             # ccsr_consistency_loss = ccsr_nerf_loss(ccsr_output, x_fake)
-            gloss_all = gloss  + (g_class_loss * lambda_cls_g) #+ ccsr_consistency_loss
+
+            ccsr_patch_loss = ccsr_loss(ccsr_output, rgbs.view(batch_size, 3, 64, 64))
+
+            gloss_all = (gloss + gloss_ccsr)/2 + (g_class_loss * lambda_cls_g) + 10.0 * ccsr_patch_loss 
+            # gloss_all = gloss  + (g_class_loss * lambda_cls_g) #+ ccsr_consistency_loss
             # gloss_all = gloss   #+ ccsr_consistency_loss
 
             gloss_all.backward()
@@ -250,10 +270,13 @@ def main():
             if (it + 1) % config['training']['print_every'] == 0:
                 wandb.log({
                     "loss/generator": gloss,
+                    "loss/gloss_ccsr": gloss_ccsr,
                     "loss/glabel": g_class_loss,
-                    # "loss/ccsr_consistency": ccsr_consistency_loss,
+                    "loss/ccsr": ccsr_patch_loss,
                     "loss/generator_total": gloss_all,
                     "loss/discriminator": total_d_loss,
+                    "loss/dloss_ccsr": dloss_ccsr,
+                    "loss/dloss_fake": dloss_fake,
                     "loss/dlabel": d_class_loss,
                     "loss/regularizer": reg,
                     "learning rate/generator": current_lr_g,
@@ -294,7 +317,15 @@ def main():
                     plist.append(poses)
                 ptest = torch.stack(plist)
 
-                rgb, depth, acc = evaluator.create_samples(ztest.to(device), label_test, ptest)
+                angles = [0, 45, 90, 135, 180, 225, 270, 315]
+                test_labels_list = []
+                for angle in angles:
+                    label = vec_307 + [0.5, float(angle)]
+                    test_labels_list.append(label)
+
+                label_test_all = torch.tensor(test_labels_list, dtype=torch.float32).to(device)
+
+                rgb, depth, acc = evaluator.create_samples(ztest.to(device), label_test_all, ptest)
         
                 wandb.log({
                     "sample/rgb": [wandb.Image(rgb, caption=f"RGB at iter {it}")],

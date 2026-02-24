@@ -5,144 +5,119 @@ import torchvision.models as models
 
 
 class ConsistencyControllingLatentCode(nn.Module):
-    """一致性控制潛在代碼 (CCLC)"""
+    """一致性控制潛在代碼 (CCLC) - 支援動態尺寸"""
     
-    def __init__(self, num_views: int, lr_height: int, lr_width: int, scale_factor: int = 4):
+    def __init__(self, num_views: int):
         super().__init__()
         self.num_views = num_views
-        self.scale_factor = scale_factor
         
-        # 為每個視角初始化可學習的潛在代碼
+        # 初始化為基礎大小 (例如 8x8)，forward 時再動態縮放
         self.latent_codes = nn.Parameter(
-            torch.randn(num_views, 3, scale_factor * lr_height, scale_factor * lr_width) * 0.01
+            torch.randn(num_views, 3, 32, 32) * 0.01
         )
         
-    def forward(self, view_idx: int) -> torch.Tensor:
-        """獲取特定視角的潛在代碼"""
+    def forward(self, view_idx: int, target_size: tuple) -> torch.Tensor:
+        """獲取特定視角的潛在代碼並縮放到目標尺寸 (H, W)"""
         if isinstance(view_idx, torch.Tensor):
             view_idx = view_idx.item()
-        return self.latent_codes[view_idx % self.num_views]
+        
+        code = self.latent_codes[view_idx % self.num_views]
+        
+        # 動態縮放到與當前輸入圖片一致的大小
+        # target_size 預期為 (height, width)
+        return F.interpolate(code.unsqueeze(0), size=target_size, mode='bilinear', align_corners=False).squeeze(0)
 
 
 class ConsistencyEnforcingModule(nn.Module):
-    """一致性執行模組 (CEM)"""
-    
     def __init__(self, blur_kernel_size: int = 3):
         super().__init__()
-        # 定義模糊核
         self.blur_kernel_size = blur_kernel_size
-        kernel = torch.ones(1, 1, blur_kernel_size, blur_kernel_size) / (blur_kernel_size * blur_kernel_size)
-        self.register_buffer('blur_kernel', kernel)
-        
+        # 使用高斯核代替均勻核，這能提供更好的邊緣平滑效果
+        sigma = blur_kernel_size / 3.0
+        x = torch.arange(blur_kernel_size) - blur_kernel_size // 2
+        kernel_1d = torch.exp(-0.5 * (x / sigma) ** 2)
+        kernel_1d = kernel_1d / kernel_1d.sum()
+        kernel_2d = kernel_1d[:, None] * kernel_1d[None, :]
+        self.register_buffer('blur_kernel', kernel_2d.unsqueeze(0).unsqueeze(0))
+    
     def forward(self, sr_image: torch.Tensor, lr_image: torch.Tensor) -> torch.Tensor:
-        """使用模糊核的CEM實現"""
-        # 使用模糊核對SR圖像進行模糊處理
-        blurred = F.conv2d(sr_image, 
-                        self.blur_kernel.expand(sr_image.size(1), -1, -1, -1), 
-                        padding=self.blur_kernel_size//2, 
-                        groups=sr_image.size(1))
+        # 1. H 矩陣操作：模糊 + 下採樣 (模擬退化過程)
+        blurred = F.conv2d(sr_image, self.blur_kernel.expand(sr_image.size(1), -1, -1, -1), 
+                          padding=self.blur_kernel_size//2, groups=sr_image.size(1))
         downsampled = F.interpolate(blurred, size=lr_image.shape[-2:], mode='bilinear', align_corners=False)
-        """執行一致性強制"""
-        # 簡化的CEM實現
-        # 對SR圖像進行下採樣
-        # scale = sr_image.shape[-1] // lr_image.shape[-1]
-        # downsampled = F.interpolate(sr_image, size=lr_image.shape[-2:], mode='bilinear', align_corners=False)
         
-        # 計算殘差並上採樣
+        # 2. 計算數據一致性殘差 (Data Consistency)
         residual = lr_image - downsampled
         upsampled_residual = F.interpolate(residual, size=sr_image.shape[-2:], mode='bilinear', align_corners=False)
         
-        # 應用修正
-        refined_sr_image = sr_image + 0.5 * upsampled_residual
-        
-        return refined_sr_image
-
-# class ConsistencyEnforcingModule(nn.Module):
-#     def __init__(self, blur_kernel_size: int = 3, noise_std: float = 0.0):
-#         super().__init__()
-#         # 創建高斯模糊核
-#         self.blur_kernel_size = blur_kernel_size
-#         self.noise_std = noise_std
-#         self._create_blur_kernel()
-        
-#     def _create_blur_kernel(self):
-#         # 創建高斯核而不是均勻核
-#         sigma = self.blur_kernel_size / 3.0
-#         kernel_1d = torch.exp(-0.5 * ((torch.arange(self.blur_kernel_size) - self.blur_kernel_size // 2) / sigma) ** 2)
-#         kernel_1d = kernel_1d / kernel_1d.sum()
-#         kernel_2d = kernel_1d[:, None] * kernel_1d[None, :]
-#         self.register_buffer('blur_kernel', kernel_2d.unsqueeze(0).unsqueeze(0))
+        # 3. 修正 SR 圖像：這裡權重建議設為 1.0 以嚴格遵守一致性
+        refined_sr = sr_image + 1.0 * upsampled_residual
+        return refined_sr
     
-#     def forward(self, sr_image: torch.Tensor, lr_image: torch.Tensor) -> torch.Tensor:
-#         """基於論文公式的CEM實現"""
-#         # H矩阵操作：模糊+下採樣
-#         blurred = F.conv2d(sr_image, self.blur_kernel.expand(sr_image.size(1), -1, -1, -1), 
-#                           padding=self.blur_kernel_size//2, groups=sr_image.size(1))
-#         downsampled = F.interpolate(blurred, size=lr_image.shape[-2:], mode='bilinear')
-        
-#         # 添加噪聲模型（如果指定）
-#         if self.noise_std > 0:
-#             noise = torch.randn_like(downsampled) * self.noise_std
-#             downsampled = downsampled + noise
-        
-#         # 計算正交投影
-#         # P_N(H)⊥ = H^T(HH^T)^(-1)H
-#         residual = lr_image - downsampled
-#         upsampled_residual = F.interpolate(residual, size=sr_image.shape[-2:], mode='bilinear')
-        
-#         # 修正SR圖像
-#         refined_sr = sr_image + upsampled_residual
-        
-#         return refined_sr
-    
+class ResBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(channels, channels, 3, padding=1)
+        )
+    def forward(self, x):
+        return x + self.conv(x)  # 殘差連接
 
 class CCSR(nn.Module):
-    """一致性控制超分辨率模組"""
+    """一致性控制超分辨率模組 - 全動態尺寸支援"""
     
-    def __init__(self, num_views: int, lr_height: int, lr_width: int, scale_factor: int = 4):
+    def __init__(self, num_views: int, scale_factor: int = 1):
         super().__init__()
         
+        self.num_views = num_views
         self.scale_factor = scale_factor
-        self.cclc = ConsistencyControllingLatentCode(num_views, 64, 64, 1)
+        
+        # CCLC 現在不需要預設的 lr_height/lr_width
+        self.cclc = ConsistencyControllingLatentCode(num_views)
         self.cem = ConsistencyEnforcingModule()
         
-        # 簡化的超分辨率網絡
         self.sr_network = self._build_sr_network(scale_factor)
-        self.activation = nn.LeakyReLU(0.2)
-        
+        self.activation = nn.Tanh()
+
     def _build_sr_network(self, scale_factor: int) -> nn.Module:
-        """構建超分辨率網絡"""
         return nn.Sequential(
-            nn.Conv2d(6, 64, 3, padding=1),  # 6 = 3(LR) + 3(latent)
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(64, 64, 3, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(64, 64, 3, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(64, 3 * scale_factor * scale_factor, 3, padding=1),
-            nn.PixelShuffle(scale_factor)
-        )
+            nn.Conv2d(6, 64, 3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            ResBlock(64), # 加入殘差塊
+            ResBlock(64),
+            ResBlock(64),
+            nn.Conv2d(64, 3, 3, padding=1)
+    )   
+    # def _build_sr_network(self, scale_factor: int) -> nn.Module:
+    #     """構建網路，scale_factor=1 時不改變解析度"""
+    #     return nn.Sequential(
+    #         nn.Conv2d(6, 64, 3, padding=1),  # 3(RGB) + 3(Latent)
+    #         nn.LeakyReLU(0.2),
+    #         nn.Conv2d(64, 64, 3, padding=1),
+    #         nn.LeakyReLU(0.2),
+    #         nn.Conv2d(64, 3 * scale_factor * scale_factor, 3, padding=1),
+    #         # nn.PixelShuffle(scale_factor)
+    #     )
     
     def forward(self, lr_image: torch.Tensor, view_idx: int) -> torch.Tensor:
-        """CCSR前向傳播"""
-        batch_size = lr_image.shape[0]
+        """CCSR 前向傳播：輸出尺寸動態跟隨 lr_image"""
+        batch_size, _, h, w = lr_image.shape
         
-        # 獲取潛在代碼
-        latent_code = self.cclc(view_idx)
+        # 1. 獲取潛在代碼並動態縮放到輸入影像的大小 (h, w)
+        latent_code = self.cclc(view_idx, (h, w))
         latent_code = latent_code.unsqueeze(0).expand(batch_size, -1, -1, -1)
         
-        # 上採樣低分辨率圖像
-        lr_upsampled = F.interpolate(lr_image, size=latent_code.shape[-2:], mode='bilinear', align_corners=False)
+        # 2. 連接輸入 (此處尺寸已完全對齊)
+        combined_input = torch.cat([lr_image, latent_code], dim=1)
         
-        # 連接輸入
-        combined_input = torch.cat([lr_upsampled, latent_code], dim=1)
-        
-        # 生成超分辨率圖像
+        # 3. 通過網路生成增強影像
         sr_output = self.sr_network(combined_input)
         sr_output = self.activation(sr_output)
-        sr_output = torch.clamp(sr_output, -1, 1)  # 匹配GRAF的圖像範圍 [-1, 1]
+        sr_output = torch.clamp(sr_output, -1, 1)
         
-        # 應用CEM
+        # 4. 應用一致性執行模組 (CEM)
         refined_sr = self.cem(sr_output, lr_image)
         
         return refined_sr
