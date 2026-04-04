@@ -60,7 +60,7 @@ class Generator(object):
         self.use_test_kwargs = False
         self.render = partial(render, H=self.H, W=self.W, focal=self.focal, chunk=self.chunk)
 
-    def __call__(self, z, label, rays=None, return_ccsr_output=False):
+    def __call__(self, z, label, hidden_state, rays=None, return_ccsr_output=False):
         bs = z.shape[0]
         if rays is None:
             if self.use_default_rays :
@@ -89,7 +89,7 @@ class Generator(object):
 
         render_kwargs['features'] = z
         label_input = label[:, :7]
-        rgb, disp, acc, extras = render(self.H, self.W, self.focal, label_input, chunk=self.chunk, rays=rays,
+        rgb, disp, acc, extras = render(self.H, self.W, self.focal, label_input, hidden_state, chunk=self.chunk, rays=rays,
                                         **render_kwargs)
 
         rays_to_output = lambda x: x.view(len(x), -1) * 2 - 1      # (BxN_samples)xC

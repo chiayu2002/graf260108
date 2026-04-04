@@ -59,7 +59,7 @@ class Evaluator(EvaluatorBase):
         return self.generator.val_ray_sampler(self.generator.H, self.generator.W,
                                               self.generator.focal, pose)[0]
 
-    def create_samples(self, z, label, poses=None):
+    def create_samples(self, z, label, hidden_state, poses=None):
         self.generator.eval()
 
         N_samples = len(z)
@@ -77,7 +77,7 @@ class Evaluator(EvaluatorBase):
                 bs = len(z_i)
                 if rays_i is not None:
                     rays_i = rays_i.permute(1, 0, 2, 3).flatten(1, 2)       # Bx2x(HxW)xC -> 2x(BxHxW)x3
-                rgb_i, disp_i, acc_i, _ = self.generator(z_i, label, rays=rays_i)
+                rgb_i, disp_i, acc_i, _ = self.generator(z_i, label, hidden_state, rays=rays_i)
 
                 reshape = lambda x: x.view(bs, self.generator.H, self.generator.W, x.shape[1]).permute(0, 3, 1, 2)  # (NxHxW)xC -> NxCxHxW
                 rgb.append(reshape(rgb_i).cpu())
@@ -136,12 +136,12 @@ class Evaluator(EvaluatorBase):
 
         return depth
 
-    def compute_fid_kid(self, real_label, sample_generator=None):
+    def compute_fid_kid(self, real_label, hidden_state, sample_generator=None):
         if sample_generator is None:
             def sample():
                 while True:
                     z = self.zdist.sample((self.batch_size,))
-                    rgb, _, _ = self.create_samples(z, real_label)
+                    rgb, _, _ = self.create_samples(z, real_label, hidden_state)
                     # convert to uint8 and back to get correct binning
                     rgb = (rgb / 2 + 0.5).mul_(255).clamp_(0, 255).to(torch.uint8).to(torch.float) / 255. * 2 - 1
                     yield rgb.cpu()

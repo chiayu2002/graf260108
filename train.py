@@ -1,7 +1,8 @@
 import argparse
-import os
+import os, importlib, json, glob
 import time
 import torch.nn.functional as F
+import torch.nn as nn
 import random
 import numpy as np
 import torch.optim as optim
@@ -12,6 +13,7 @@ import wandb
 import pprint
 import sys
 sys.path.append('submodules')
+import torchvision.utils as vutils
 
 from graf.gan_training import Evaluator
 from graf.config import get_data, build_models, load_config, save_config, build_lr_scheduler
@@ -33,7 +35,18 @@ def setup_directories(config):
 
 def initialize_training(config, device):
     # dataset
-    train_dataset, hwfr= get_data(config)
+        # Load extractor
+    extractor_path = config['data']['extractor_path']
+    extractor_args = json.load(open(glob.glob("/Data/home/vicky/graf260108_im64/HystereticGRU/2026-03-24_17-13-01/args.json", recursive=True)[0], "r"))
+    extractor_args = argparse.Namespace(**extractor_args)
+    extractor = importlib.import_module(f"graf.models.HystereticPrediction").__dict__[extractor_args.architecture](**vars(extractor_args))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    extractor = extractor.to(device)
+    state_dict = torch.load(glob.glob(extractor_path, recursive=True)[0])["state_dict"]
+    status = extractor.load_state_dict(state_dict)
+    print("Extractor Loading Status: ", status)
+
+    train_dataset, hwfr= get_data(config, extractor, extractor_args)
 
     # print("=== Label Check ===")
     # print(f"Total images: {len(train_dataset)}")
@@ -168,12 +181,13 @@ def main():
 
     n_each_task = [2, 3, 2] 
     criterion_cls = MCE_Loss().to(device)
+    # criterion_label = nn.MSELoss().to(device)
     lambda_cls_d = 1.0
     lambda_cls_g = 1.0
 
     while True:
         epoch_idx += 1
-        for x_real, label in tqdm(train_loader, desc=f"Epoch {epoch_idx}"):
+        for x_real, label, hidden_state in tqdm(train_loader, desc=f"Epoch {epoch_idx}"):
             it += 1
 
             # criterion_cls = torch.nn.CrossEntropyLoss().to(device)
@@ -205,7 +219,7 @@ def main():
             
             #fake data
             with torch.no_grad():
-                x_fake, _ = generator(z, label)
+                x_fake, _ = generator(z, label, hidden_state)
             x_fake.requires_grad_()
 
             d_fake, _ = discriminator(x_fake, label)
@@ -214,16 +228,16 @@ def main():
             # 新增：針對 CCSR 輸出的判別 (Fake data from CCSR)
             with torch.no_grad():
                 # 獲取 CCSR 提升後的 Patch [B, 3, 64, 64]
-                _, _, ccsr_output_d = generator(z, label, return_ccsr_output=True)
-            # 將 [B, 3, 64, 64] 轉回 Discriminator 期望的 [B*N, 3] 格式
-            # 注意：ccsr_output_d 需先轉置為 [B, 64, 64, 3] 再 reshape
+                _, _, ccsr_output_d = generator(z, label, hidden_state, return_ccsr_output=True)
+            # # 將 [B, 3, 64, 64] 轉回 Discriminator 期望的 [B*N, 3] 格式
+            # # 注意：ccsr_output_d 需先轉置為 [B, 64, 64, 3] 再 reshape
             ccsr_patch_for_d = ccsr_output_d.permute(0, 2, 3, 1).reshape(-1, 3)
             ccsr_patch_for_d.requires_grad_()
 
             d_ccsr, _ = discriminator(ccsr_patch_for_d, label)
             dloss_ccsr = compute_loss(d_ccsr, (0.0, 0.1))
 
-            total_d_loss = dloss_real + (dloss_fake + dloss_ccsr) / 2 + reg + (d_class_loss * lambda_cls_d)
+            total_d_loss = dloss_real + (dloss_fake + dloss_ccsr) / 2 + reg + (d_class_loss * lambda_cls_d) #(dloss_fake + dloss_ccsr) / 2
             # total_d_loss = dloss_real + dloss_fake + reg + (d_class_loss * lambda_cls_d)
             # total_d_loss = dloss_real + dloss_fake + reg
             total_d_loss.backward()
@@ -242,7 +256,7 @@ def main():
 
             z = zdist.sample((batch_size,))
             # x_fake, _= generator(z, label)
-            x_fake, _, ccsr_output = generator(z, label, return_ccsr_output=True)
+            x_fake, _, ccsr_output = generator(z, label, hidden_state, return_ccsr_output=True)
             d_fake, label_fake_pred = discriminator(x_fake, label)
             gloss = compute_loss(d_fake, 1)
 
@@ -256,7 +270,7 @@ def main():
 
             ccsr_patch_loss = ccsr_loss(ccsr_output, rgbs.view(batch_size, 3, 64, 64))
 
-            gloss_all = (gloss + gloss_ccsr)/2 + (g_class_loss * lambda_cls_g) + 10.0 * ccsr_patch_loss 
+            gloss_all = (gloss + gloss_ccsr)/2  + (g_class_loss * lambda_cls_g) + 1.0 * ccsr_patch_loss #  (gloss + gloss_ccsr)/2
             # gloss_all = gloss  + (g_class_loss * lambda_cls_g) #+ ccsr_consistency_loss
             # gloss_all = gloss   #+ ccsr_consistency_loss
 
@@ -300,6 +314,8 @@ def main():
 
                 vec_307 = [1.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0]
                 vec_330 = [1.0, 0.0,  0.0, 0.0, 1.0,  1.0, 0.0]
+                # vec_307 = [0.742/2.889, 1.282/1.282]
+                # vec_330 = [2.889/2.889, 1.106/1.282]
                 test_labels_list = []
                 for i in range(batch_size):
                     if i < batch_size // 2:
@@ -325,19 +341,24 @@ def main():
 
                 label_test_all = torch.tensor(test_labels_list, dtype=torch.float32).to(device)
 
-                rgb, depth, acc = evaluator.create_samples(ztest.to(device), label_test_all, ptest)
+                rgb, depth, acc = evaluator.create_samples(ztest.to(device), label_test_all, hidden_state, ptest)
+
+                grid_rgb = vutils.make_grid(rgb.detach().cpu(), nrow=8, normalize=True)
+                grid_depth = vutils.make_grid(depth.detach().cpu(), nrow=8, normalize=True)
+                grid_acc = vutils.make_grid(acc.detach().cpu(), nrow=8, normalize=True)
+                
         
                 wandb.log({
-                    "sample/rgb": [wandb.Image(rgb, caption=f"RGB at iter {it}")],
-                    "sample/depth": [wandb.Image(depth, caption=f"Depth at iter {it}")],
-                    "sample/acc": [wandb.Image(acc, caption=f"Acc at iter {it}")],
+                    "sample/rgb": [wandb.Image(grid_rgb, caption=f"RGB at iter {it}")],
+                    "sample/depth": [wandb.Image(grid_depth, caption=f"Depth at iter {it}")],
+                    "sample/acc": [wandb.Image(grid_acc, caption=f"Acc at iter {it}")],
                     "epoch_idx": epoch_idx,
                     "iteration": it
                 })
 
              # (v) Compute fid if necessary
             if fid_every > 0 and ((it + 1) % fid_every) == 0:
-                fid, kid = evaluator.compute_fid_kid(label)
+                fid, kid = evaluator.compute_fid_kid(label, hidden_state)
                 wandb.log({
                         "validation/fid": fid,
                         "validation/kid": kid,

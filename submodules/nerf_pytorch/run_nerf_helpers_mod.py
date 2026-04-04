@@ -78,7 +78,7 @@ class NeRF(nn.Module):
         self.numclasses = numclasses
         
         self.pts_linears = nn.ModuleList(
-            [nn.Linear(input_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
+            [nn.Linear(input_ch+W, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch+W, W) for i in range(D-1)])
         
         ### Implementation according to the official code release (https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105)
         self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W//2)])
@@ -105,6 +105,8 @@ class NeRF(nn.Module):
                 nn.ReLU(), # 建議加 ReLU
                 nn.Linear(W, W)
                 )
+        
+        self.condition_feature = nn.Linear(1024, W)
             
         if use_viewdirs:
             self.feature_linear = nn.Linear(W, W)
@@ -113,11 +115,12 @@ class NeRF(nn.Module):
         else:
             self.output_linear = nn.Linear(W, output_ch)
 
-    def forward(self, x, label):
+    def forward(self, x, label, hidden_state):
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1) #torch.Size([65536, 319]),torch.Size([65536, 27])
         h = input_pts
 
         label = label.to(input_pts.device)
+        hidden_state=hidden_state.to(input_pts.device)
 
         # 1. 解碼各個屬性 (找出它是該屬性的第幾類)
         ar_idx = label[:, :2].argmax(dim=-1)   # AR 是第幾類?
@@ -129,12 +132,13 @@ class NeRF(nn.Module):
         # label_embedding = self.condition_embedding(label)
         label_onehot = F.one_hot(class_idx, num_classes=self.numclasses).float()
         label_embedding = self.condition_embedding(label_onehot)
+        feature_embedding = self.condition_feature(hidden_state)
         # repeat_times = h.shape[0] // label_embedding.shape[0]
         # label_embedding = label_embedding.repeat(repeat_times, 1)
 
         input_o, input_shape = torch.split(input_pts, [63, 256], dim=-1)
         conditioned_shape = input_shape * label_embedding
-        conditioned_input = torch.cat([input_o, conditioned_shape], dim=-1)
+        conditioned_input = torch.cat([input_o, conditioned_shape, feature_embedding], dim=-1)
         h = conditioned_input
         for i, l in enumerate(self.pts_linears):
             h = self.pts_linears[i](h)

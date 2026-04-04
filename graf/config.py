@@ -11,7 +11,7 @@ from .utils import polar_to_cartesian, look_at
 def to_tensor_and_normalize(x):
         return x * 2 - 1
 
-def get_data(config):
+def get_data(config, extractor, extractor_args):
     H = W = imsize = config['data']['imsize']
     dset_type = config['data']['type']
     fov = config['data']['fov']
@@ -31,7 +31,7 @@ def get_data(config):
         dset = Carla(**kwargs)
     
     elif dset_type == 'RS307_0_i2':
-        dset = RS307_0_i2(**kwargs)
+        dset = RS307_0_i2(extractor=extractor, extractor_args=extractor_args, **kwargs)
 
     dset.H = dset.W = imsize
     dset.focal = W/2 * 1 / np.tan((.5 * fov * np.pi/180.))

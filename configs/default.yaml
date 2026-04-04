@@ -1,6 +1,7 @@
-expname: column260223_0730_disinputlabel_MCE_nerf12class_ccsr_tanh_latent_codes_modloss_resb_ccsrpatchloss50_faketarget
+expname: column260326_tanh_latentcodes_modloss_ccsr_gru
 data:
-  datadir: [data/RS307_n, data/RS330_n] #, data/RS315_n , data/RS615_n
+  datadir: [data/RS307_n, data/RS330_n, data/RS615_n] #, data/RS315_n , data/RS615_n
+  extractor_path: /Data/home/vicky/graf260108_im64/HystereticGRU/2026-03-24_17-13-01/Opensees Based damage Patterns Generation/c7d0zrxf/checkpoints/best.ckpt
   far: 4.5
   fov: 20
   imsize: 256  
@@ -79,4 +80,4 @@ ccsr:
 wandb:
   project: graf260108
   entity: vicky20020808
-  name: RS0730_disinputlabel_MCE_nerf12class_ccsr_tanh_latent_codes_modloss_resb_ccsrpatchloss10_faketarget
+  name: tanh_latent_codes_modloss_ccsr_gru
