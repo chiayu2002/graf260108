@@ -1,5 +1,4 @@
 import torch
-# torch.autograd.set_detect_anomaly(True)
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
@@ -66,8 +65,6 @@ def get_embedder(multires, i=0):
 # Model
 class NeRF(nn.Module):
     def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False, numclasses=4, cond=True):
-        """ 
-        """
         super(NeRF, self).__init__()
         self.D = D
         self.W = W
@@ -80,64 +77,64 @@ class NeRF(nn.Module):
         self.pts_linears = nn.ModuleList(
             [nn.Linear(input_ch+W, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch+W, W) for i in range(D-1)])
         
-        ### Implementation according to the official code release (https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105)
         self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W//2)])
-
-        ### Implementation according to the paper
-        # self.views_linears = nn.ModuleList(
-        #     [nn.Linear(input_ch_views + W, W//2)] + [nn.Linear(W//2, W//2) for i in range(D//2)])
-        
-        # self.condition_embedding = nn.Sequential(
-        #         nn.Embedding(numclasses, W),
-        #         nn.LayerNorm(W)
-        #         )
-        # self.condition_embedding = nn.Sequential(
-        #         nn.Embedding(numclasses, W),
-        #         nn.LayerNorm(W),
-        #         nn.Linear(W,W),
-        #         nn.ReLU(), 
-        #         nn.LayerNorm(W)
-        #         )
 
         self.condition_embedding = nn.Sequential(
                 nn.Linear(numclasses, W), 
                 nn.LayerNorm(W),
-                nn.ReLU(), # 建議加 ReLU
+                nn.ReLU(),
                 nn.Linear(W, W)
                 )
         
+        # condition_feature: 1024 → W (256)
+        # 在 run_network 中被提前呼叫以減少記憶體
         self.condition_feature = nn.Linear(1024, W)
             
         if use_viewdirs:
             self.feature_linear = nn.Linear(W, W)
-            self.alpha_linear = nn.Linear(W, numclasses*1)  #numclasses*
-            self.rgb_linear = nn.Linear(W//2, numclasses*3)
+            self.alpha_linear = nn.Linear(W, 1)
+            self.rgb_linear = nn.Linear(W//2, 3)
         else:
             self.output_linear = nn.Linear(W, output_ch)
 
     def forward(self, x, label, hidden_state):
-        input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1) #torch.Size([65536, 319]),torch.Size([65536, 27])
+        input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
         h = input_pts
 
         label = label.to(input_pts.device)
-        hidden_state=hidden_state.to(input_pts.device)
+        hidden_state = hidden_state.to(input_pts.device)
 
-        # 1. 解碼各個屬性 (找出它是該屬性的第幾類)
-        ar_idx = label[:, :2].argmax(dim=-1)   # AR 是第幾類?
-        tr_idx = label[:, 2:5].argmax(dim=-1)  # TR 是第幾類?
-        lr_idx = label[:, 5:7].argmax(dim=-1)  # LR 是第幾類?
-        class_idx = ar_idx * 6 + tr_idx * 2 + lr_idx
-        class_idx = class_idx.long()
-        # class_idx = label.argmax(dim=-1).long()
-        # label_embedding = self.condition_embedding(label)
-        label_onehot = F.one_hot(class_idx, num_classes=self.numclasses).float()
-        label_embedding = self.condition_embedding(label_onehot)
-        feature_embedding = self.condition_feature(hidden_state)
-        # repeat_times = h.shape[0] // label_embedding.shape[0]
-        # label_embedding = label_embedding.repeat(repeat_times, 1)
+        # ========================================================
+        # [修正4] 修正變數名稱：label 結構是 [AR(2), LR(3), TR(2)]
+        # 原本 tr_idx 和 lr_idx 的名稱寫反了
+        # 雖然 class_idx 的最終計算結果是正確的（一對一映射），
+        # 但變數名應該要和實際對應的屬性一致
+        # ========================================================
+        # ar_idx = label[:, :2].argmax(dim=-1)     # AR: Aspect Ratio，2 類
+        # lr_idx = label[:, 2:5].argmax(dim=-1)    # LR: Longitudinal Reinforcement Ratio，3 類
+        # tr_idx = label[:, 5:7].argmax(dim=-1)    # TR: Transverse Reinforcement Ratio，2 類
+        # class_idx = ar_idx * 6 + lr_idx * 2 + tr_idx  # AR(2) × LR(3) × TR(2) = 12 種組合
+        # class_idx = class_idx.long()
+
+        # label_onehot = F.one_hot(class_idx, num_classes=self.numclasses).float()
+        # label_embedding = self.condition_embedding(label_onehot)  # [N, W]
+        
+        # ========================================================
+        # [修正3] 判斷 hidden_state 是否已被投影
+        # 如果在 run_network 中已經用 condition_feature 投影過（256維），直接使用
+        # 如果還是原始的 1024 維，在此投影
+        # 這樣做的好處是 backward compatible，
+        # 不管是從 run_network 呼叫（已投影）或直接呼叫（未投影）都能正確運作
+        # ========================================================
+        if hidden_state.shape[-1] == self.W:
+            # 已經在 run_network 中投影過了 (256維)
+            feature_embedding = hidden_state
+        else:
+            # 原始 hidden_state (1024維)，需要投影
+            feature_embedding = self.condition_feature(hidden_state)
 
         input_o, input_shape = torch.split(input_pts, [63, 256], dim=-1)
-        conditioned_shape = input_shape * label_embedding
+        conditioned_shape = input_shape #* label_embedding
         conditioned_input = torch.cat([input_o, conditioned_shape, feature_embedding], dim=-1)
         h = conditioned_input
         for i, l in enumerate(self.pts_linears):
@@ -147,28 +144,19 @@ class NeRF(nn.Module):
                 h = torch.cat([h, conditioned_input], -1)
 
         if self.use_viewdirs:
-            # alpha = self.alpha_linear(h)
-            all_alphas = self.alpha_linear(h)
-            alpha = all_alphas.gather(1, class_idx.unsqueeze(1))
+            alpha = self.alpha_linear(h)
+            # alpha = all_alphas.gather(1, class_idx.unsqueeze(1))
             feature = self.feature_linear(h)
-            # input_d, input_shape = torch.split(input_views, [27, 256], dim=-1)
-            # conditioned_shape = input_shape * label_embedding
-            # label_feat = torch.cat([input_d, conditioned_shape],dim=-1)
             h = torch.cat([feature, input_views], -1)
-            # label_feat = feature * label_embedding
-
-            # h = torch.cat([label_feat, input_views], -1)
         
             for i, l in enumerate(self.views_linears):
                 h = self.views_linears[i](h)
                 h = relu(h)
 
-            # rgb = self.rgb_linear(h)
-            all_rgbs = self.rgb_linear(h)
-            all_rgbs = all_rgbs.view(-1, self.numclasses, 3)
-            # 擴展索引以匹配 RGB 的 3 個通道
-            idx_expanded = class_idx.unsqueeze(1).unsqueeze(2).expand(-1, 1, 3)
-            rgb = all_rgbs.gather(1, idx_expanded).squeeze(1)
+            rgb = self.rgb_linear(h)
+            # all_rgbs = all_rgbs.view(-1, self.numclasses, 3)
+            # idx_expanded = class_idx.unsqueeze(1).unsqueeze(2).expand(-1, 1, 3)
+            # rgb = all_rgbs.gather(1, idx_expanded).squeeze(1)
             outputs = torch.cat([rgb, alpha], -1)
         else:
             outputs = self.output_linear(h)
@@ -176,7 +164,14 @@ class NeRF(nn.Module):
         return outputs   
 
 
-# Ray helpers
+# ========================================================
+# [修正2] 移除 get_rays 中的 debug 程式碼
+# 原本每次呼叫都會:
+#   1. rays_d.detach().cpu() → GPU→CPU 複製 256×256×3 tensor，
+#      強制 GPU pipeline 同步等待，嚴重影響效能
+#   2. 計算角度值但結果從未使用（print 被註解掉了）
+# 每個 iteration 呼叫 get_rays 至少 8 次（batch_size=8）
+# ========================================================
 def get_rays(H, W, focal, c2w):
     i, j = torch.meshgrid(torch.linspace(0, W-1, W), torch.linspace(0, H-1, H))  # pytorch's meshgrid has indexing='ij'
     i = i.t()
@@ -186,28 +181,13 @@ def get_rays(H, W, focal, c2w):
     z = -torch.ones_like(i)
 
     dirs = torch.stack([x, y, z], -1)
-    # Rotate ray directions from camera frame to the world frame
-    rays_d = torch.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
-    # Translate camera frame's origin to the world frame. It is the origin of all rays.
-    rays_o = c2w[:3,-1].expand(rays_d.shape) #torch.Size([128, 128, 3])
+    rays_d = torch.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)
+    rays_o = c2w[:3,-1].expand(rays_d.shape)
 
-    # 在這裡直接驗證射線方向
-    rays_d_cpu = rays_d.detach().cpu()
-    
-    # 檢查中心射線的方向
-    def calculate_ray_angle(ray):
-        return np.degrees(np.arctan2(ray[0], -ray[2]))
-    
-    # 檢查射線分布
-    center_ray = rays_d_cpu[H//2, W//2]
-    left_ray = rays_d_cpu[H//2, 0]
-    right_ray = rays_d_cpu[H//2, -1]
-    
-    # print(f"左邊 x/z: {(-W/2/focal):.4f}")
-    # print(f"右邊 x/z: {(W/2/focal):.4f}")
-    # print(f"中心射線角度: {calculate_ray_angle(center_ray):.2f}°")
-    # print(f"左邊射線角度: {calculate_ray_angle(left_ray):.2f}°")
-    # print(f"右邊射線角度: {calculate_ray_angle(right_ray):.2f}°")
+    # [修正2] 已移除 debug 程式碼:
+    # rays_d_cpu = rays_d.detach().cpu()   ← 每次呼叫都做 GPU→CPU 複製!
+    # calculate_ray_angle(...)              ← 計算但從不使用
+    # center_ray, left_ray, right_ray      ← 計算但從不使用
     
     return rays_o, rays_d
 

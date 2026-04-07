@@ -3,17 +3,16 @@ import torch
 from ..utils import sample_on_sphere, look_at, to_sphere 
 from graf.transforms import ImgToPatch
 from ..transforms import FullRaySampler
-from submodules.nerf_pytorch.run_nerf_mod import render, run_network            # import conditional render
+from submodules.nerf_pytorch.run_nerf_mod import render, run_network
 from functools import partial
 import torch.nn.functional as F  
 from graf.models.ccsr import CCSR
 import os
-import pickle
 
 
 class Generator(object):
     def __init__(self, H, W, focal, radius, ray_sampler, render_kwargs_train, render_kwargs_test, parameters, named_parameters,
-                 range_u=(0,1), range_v=(0.01,0.49),v=0, chunk=None, device='cuda', orthographic=False, use_default_rays=False, use_ccsr=True, num_views=8):
+                 range_u=(0,1), range_v=(0.01,0.49), v=0, chunk=None, device='cuda', orthographic=False, use_default_rays=False, use_ccsr=True, num_views=8):
         self.device = device
         self.H = int(H)
         self.W = int(W)
@@ -41,10 +40,13 @@ class Generator(object):
             if module is not None:
                 self.module_dict[name] = module
 
-        # 添加CCSR模組
+        # ========================================================
+        # [效能優化] 預先解析 v_list，避免每次 forward 都做字串分割
+        # 原本在 __call__ 中: [float(x.strip()) for x in self.v.split(",")]
+        # ========================================================
+        self._v_list = [float(x.strip()) for x in self.v.split(",")]
+
         if self.use_ccsr:
-            # 假設低分辨率圖像尺寸為原圖的1/4
-            # lr_height, lr_width = H // 4, W // 4
             self.ccsr = CCSR(num_views=num_views, scale_factor=1).to(device)
             self.module_dict['ccsr'] = self.ccsr
             
@@ -63,80 +65,69 @@ class Generator(object):
     def __call__(self, z, label, hidden_state, rays=None, return_ccsr_output=False):
         bs = z.shape[0]
         if rays is None:
-            if self.use_default_rays :
+            if self.use_default_rays:
                 rays = torch.cat([self.sample_rays() for _ in range(bs)], dim=1)
             else:
                 all_rays = []
-                v_list = [float(x.strip()) for x in self.v.split(",")]
-
                 for i in range(label.size(0)):
                     second_value = label[i, 7].item()
-                    index = int(label[i, 8].item())  # 得到第3個值
+                    index = int(label[i, 8].item())
 
-                    # 基礎 u v值計算
                     selected_u = index / 360
-                    selected_v = v_list[int(second_value)]
+                    selected_v = self._v_list[int(second_value)]  # 使用預解析的 v_list
 
-                    # 使用選定的角度生成光線
-                    rays = self.sample_select_rays(selected_u, selected_v)
-                    all_rays.append(rays)
+                    rays_i = self.sample_select_rays(selected_u, selected_v)
+                    all_rays.append(rays_i)
                     
                 rays = torch.cat(all_rays, dim=1)
 
-
         render_kwargs = self.render_kwargs_test if self.use_test_kwargs else self.render_kwargs_train
-        render_kwargs = dict(render_kwargs)        # copy
+        render_kwargs = dict(render_kwargs)
 
         render_kwargs['features'] = z
         label_input = label[:, :7]
         rgb, disp, acc, extras = render(self.H, self.W, self.focal, label_input, hidden_state, chunk=self.chunk, rays=rays,
                                         **render_kwargs)
 
-        rays_to_output = lambda x: x.view(len(x), -1) * 2 - 1      # (BxN_samples)xC
-    
-        # if self.use_test_kwargs:               # return all outputs
-        #     return rays_to_output(rgb), \
-        #            rays_to_output(disp), \
-        #            rays_to_output(acc), extras
+        rays_to_output = lambda x: x.view(len(x), -1) * 2 - 1
 
         rgb_nerf = rays_to_output(rgb)
         disp_out = rays_to_output(disp)
         acc_out = rays_to_output(acc)
 
-        # 如果啟用CCSR並且需要返回CCSR輸出
         ccsr_output = None
         if self.use_ccsr and return_ccsr_output:
-            # 1. 將 NeRF 的 Patch 轉回圖像格式 (例如 64x64)
-            # 注意：現在不需要對 rgb 進行下採樣，直接將 NeRF 輸出作為 CCSR 的輸入
             patch_size = int(np.sqrt(rgb.shape[0] // bs))
             nerf_patch = rgb.view(bs, patch_size, patch_size, 3).permute(0, 3, 1, 2).contiguous()
             
-            # 2. 獲取視角對應的 Latent Code
-            ccsr_results = []
-            for i in range(bs):
-                angle_idx = int(label[i, 8].item())  # 根據您的標籤索引調整
-                view_idx = (angle_idx * self.ccsr.num_views) // 360
-                
-                # 3. 通過 CCSR 網路提升細節
-                # 注意：此處傳入的 nerf_patch[i:i+1] 是 LR 輸入
-                refined_sr = self.ccsr(nerf_patch[i:i+1], view_idx)
-                ccsr_results.append(refined_sr)
+            # ========================================================
+            # [效能優化] 向量化 CCSR 處理
+            # 原本：逐樣本 for loop，batch_size=1 處理
+            # 現在：按 view_idx 分組，每組批次處理
+            # 同一個 view_idx 的樣本一起通過 CCSR 網路
+            # ========================================================
+            angle_indices = label[:, 8].int()
+            view_indices = (angle_indices * self.ccsr.num_views) // 360
             
-            ccsr_output = torch.cat(ccsr_results, dim=0)
+            unique_views = torch.unique(view_indices)
+            ccsr_results = torch.zeros_like(nerf_patch)
+            
+            for vidx in unique_views:
+                mask = (view_indices == vidx)
+                batch_input = nerf_patch[mask]
+                batch_output = self.ccsr(batch_input, vidx.item())
+                ccsr_results[mask] = batch_output
+            
+            ccsr_output = ccsr_results
 
         if self.use_test_kwargs:
-            # eval 模式：如果要求 CCSR 則多回傳一個，否則維持原樣回傳 4 個值
             if return_ccsr_output:
                 return rgb_nerf, disp_out, acc_out, extras, ccsr_output
             return rgb_nerf, disp_out, acc_out, extras
-
         else:
-            # train 模式
             if return_ccsr_output:
                 return rgb_nerf, rays, ccsr_output
             return rgb_nerf, rays
-        
-        # return rgb, rays
 
     def decrease_nerf_noise(self, it):
         end_it = 5000
@@ -144,96 +135,34 @@ class Generator(object):
             noise_std = self.initial_raw_noise_std - self.initial_raw_noise_std/end_it * it
             self.render_kwargs_train['raw_noise_std'] = noise_std
 
-    def sample_pose(self):   #計算旋轉矩陣(相機姿勢)  train
-        # sample location on unit sphere
-        #print("Type of self.v:", type(self.v))
+    def sample_pose(self):
         loc = sample_on_sphere(self.range_u, self.range_v)
-        # loc = to_sphere(u, v)
-        
-        # sample radius if necessary
         radius = self.radius
         if isinstance(radius, tuple):
             radius = np.random.uniform(*radius)
-
         loc = loc * radius
         R = look_at(loc)[0]
-
         RT = np.concatenate([R, loc.reshape(3, 1)], axis=1)
         RT = torch.Tensor(RT.astype(np.float32))
         return RT
 
-
-    def sample_select_pose(self, u, v):   #計算旋轉矩陣(相機姿勢)
-        # sample location on unit sphere
-        #print("Type of self.v:", type(self.v))
-        
-        # sample radius if necessary
+    def sample_select_pose(self, u, v):
         radius = self.radius
-        
-        # 正常的球面取樣
         loc = to_sphere(u, v) * radius
         R = look_at(loc)[0]
-        
         RT = np.concatenate([R, loc.reshape(3, 1)], axis=1)
         RT = torch.Tensor(RT.astype(np.float32))
-        
         return RT
     
-    def get_canonical_poses(self):
-        """
-        返回固定世界座標上的一組標準相機姿勢。
-        這些作為世界座標系統的參考點。
-        
-        返回：
-            標準姿勢的字典
-        """
-        canonical_poses = {
-            "front": self.sample_select_pose(0.0, 0.5),    # 0°（前）
-            "right": self.sample_select_pose(0.25, 0.5),   # 90°（右）
-            "back": self.sample_select_pose(0.5, 0.5),     # 180°（後）
-            "left": self.sample_select_pose(0.75, 0.5),    # 270°（左）
-            "top": self.sample_select_pose(0.0, 0.0),      # 頂視圖
-            "bottom": self.sample_select_pose(0.0, 1.0)    # 底視圖
-        }
-        return canonical_poses
-    
-    def initialize_world_coordinates(self):
-        """
-        初始化並驗證固定的世界座標系統。
-        應該在訓練開始時調用一次。
-        """
-        # 獲取標準視圖
-        canonical_poses = self.get_canonical_poses()
-        
-        # 確保原點在 (0,0,0)
-        origin = torch.zeros(3, device=self.device)
-        
-        # 在場景中創建視覺標記來表示世界軸
-        # 這僅用於調試/可視化目的
-        self.world_axes = {
-            "x": torch.tensor([1.0, 0.0, 0.0], device=self.device),
-            "y": torch.tensor([0.0, 1.0, 0.0], device=self.device),
-            "z": torch.tensor([0.0, 0.0, 1.0], device=self.device)
-        }
-        
-        print("世界座標系統已初始化。")
-        print(f"原點: {origin}")
-        print(f"前視圖位置: {canonical_poses['front'][:3, 3]}")
-        
-        return canonical_poses
-
-    
-    def sample_rays(self):   #設train用的rays
+    def sample_rays(self):
         pose = self.sample_pose()
-        # print(f"`trainpose`:{pose}")
         sampler = self.val_ray_sampler if self.use_test_kwargs else self.ray_sampler 
         batch_rays, _, _ = sampler(self.H, self.W, self.focal, pose)
-        return batch_rays #torch.Size([2, 1024, 3])
+        return batch_rays
     
-    def sample_select_rays(self, u ,v):
+    def sample_select_rays(self, u, v):
         pose = self.sample_select_pose(u, v)
-        #print(f"trainpose:{pose}")
-        sampler = self.val_ray_sampler if self.use_test_kwargs else self.ray_sampler  #如果 self.use_test_kwargs 為真，則使用 self.val_ray_sampler
+        sampler = self.val_ray_sampler if self.use_test_kwargs else self.ray_sampler
         batch_rays, _, _ = sampler(self.H, self.W, self.focal, pose)
         return batch_rays
 
@@ -249,5 +178,3 @@ class Generator(object):
     def eval(self):
         self.use_test_kwargs = True
         self.render_kwargs_train['network_fn'].eval()
-
-    

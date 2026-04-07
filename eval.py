@@ -6,237 +6,642 @@ import time
 import copy
 import csv
 import random
+import json
+import glob
+import importlib
 import torch
 torch.set_default_tensor_type('torch.cuda.FloatTensor')
 from torchvision.utils import save_image
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
+from PIL import Image
 
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 unused import
 import matplotlib
 matplotlib.use('Agg')
-
+import matplotlib.pyplot as plt
 
 import sys
-sys.path.append('submodules')        # needed to make imports work in GAN_stability
+sys.path.append('submodules')
 
 from submodules.GAN_stability.gan_training.checkpoints_mod import CheckpointIO
-from graf.gan_training import Evaluator as Evaluator
+from graf.gan_training import Evaluator
 from graf.config import get_data, build_models, get_render_poses, load_config
-from graf.utils import count_trainable_parameters, to_phi, to_theta, get_nsamples, get_zdist
+from graf.utils import count_trainable_parameters, to_phi, to_theta, get_zdist
 from graf.transforms import ImgToPatch
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 
-checkpoint_path = '/Data/home/vicky/graf260108_im64/results/column260119_0730_reg10_acgan_real_target_modnerf_inputlabel10_7class_skip3_BCE_lr3/chkpts/model_00049999.pt'
+# ============================================================
+# 指標計算函數
+# ============================================================
+
+def compute_psnr(img_pred, img_gt):
+    """
+    計算 Peak Signal-to-Noise Ratio (PSNR)
+    
+    Args:
+        img_pred: 預測影像 [C, H, W] 或 [H, W, C]，範圍 [0, 1]
+        img_gt:   真實影像 [C, H, W] 或 [H, W, C]，範圍 [0, 1]
+    
+    Returns:
+        float: PSNR 值 (dB)
+    """
+    mse = torch.mean((img_pred - img_gt) ** 2).item()
+    if mse < 1e-10:
+        return float('inf')
+    psnr = 10 * np.log10(1.0 / mse)  # MAX=1 for [0,1] range
+    return psnr
+
+
+def compute_r_squared(img_pred, img_gt):
+    """
+    計算 R² (Coefficient of Determination)
+    
+    R² = 1 - SS_res / SS_tot
+    SS_res = Σ(y_true - y_pred)²
+    SS_tot = Σ(y_true - y_mean)²
+    
+    R² = 1.0 表示完美預測
+    R² = 0.0 表示和平均值一樣好
+    R² < 0   表示比平均值還差
+    
+    Args:
+        img_pred: 預測影像，展平後計算 [N]
+        img_gt:   真實影像，展平後計算 [N]
+    
+    Returns:
+        float: R² 值
+    """
+    pred_flat = img_pred.flatten().float()
+    gt_flat = img_gt.flatten().float()
+    
+    ss_res = torch.sum((gt_flat - pred_flat) ** 2).item()
+    ss_tot = torch.sum((gt_flat - torch.mean(gt_flat)) ** 2).item()
+    
+    if ss_tot < 1e-10:
+        return float('nan')
+    
+    r2 = 1.0 - ss_res / ss_tot
+    return r2
+
+
+def compute_ssim(img_pred, img_gt, window_size=11, C1=0.01**2, C2=0.03**2):
+    """
+    計算 Structural Similarity Index (SSIM) — 簡易版
+    
+    Args:
+        img_pred: [C, H, W]，範圍 [0, 1]
+        img_gt:   [C, H, W]，範圍 [0, 1]
+    
+    Returns:
+        float: SSIM 值
+    """
+    import torch.nn.functional as F
+    
+    # 確保是 4D [B, C, H, W]
+    if img_pred.dim() == 3:
+        img_pred = img_pred.unsqueeze(0)
+        img_gt = img_gt.unsqueeze(0)
+    
+    C = img_pred.shape[1]
+    
+    # 建立高斯視窗
+    def gaussian_window(size, sigma=1.5):
+        coords = torch.arange(size, dtype=torch.float32) - size // 2
+        g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+        g = g / g.sum()
+        return g.unsqueeze(1) @ g.unsqueeze(0)
+    
+    window = gaussian_window(window_size).unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+    window = window.expand(C, -1, -1, -1).to(img_pred.device)
+    
+    pad = window_size // 2
+    
+    mu1 = F.conv2d(img_pred, window, padding=pad, groups=C)
+    mu2 = F.conv2d(img_gt, window, padding=pad, groups=C)
+    
+    mu1_sq = mu1 ** 2
+    mu2_sq = mu2 ** 2
+    mu1_mu2 = mu1 * mu2
+    
+    sigma1_sq = F.conv2d(img_pred * img_pred, window, padding=pad, groups=C) - mu1_sq
+    sigma2_sq = F.conv2d(img_gt * img_gt, window, padding=pad, groups=C) - mu2_sq
+    sigma12 = F.conv2d(img_pred * img_gt, window, padding=pad, groups=C) - mu1_mu2
+    
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    
+    return ssim_map.mean().item()
+
+
+# ============================================================
+# 配對生成：給定真實影像的 label，生成對應的假影像
+# ============================================================
+
+def generate_paired_samples(generator, evaluator, dataset, zdist, cached_hidden_states, 
+                            device, num_pairs=100, seed=42):
+    """
+    從 dataset 中取出真實影像，並用 generator 在相同的視角和條件下生成假影像。
+    
+    返回:
+        list of dict: 每個 dict 包含 'real', 'fake', 'label', 'exp_name'
+    """
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    
+    generator.eval()
+    
+    v_list = generator._v_list
+    pairs = []
+    
+    # 從 dataset 中均勻取樣
+    indices = np.random.choice(len(dataset), size=min(num_pairs, len(dataset)), replace=False)
+    
+    for idx in indices:
+        img_real, label, hidden_state_cpu = dataset[idx]
+        
+        # img_real: [3, H, W] 範圍 [-1, 1]
+        # label: [9] = [AR(2), LR(3), TR(2), height_idx, angle_idx]
+        
+        label = label.unsqueeze(0).to(device)           # [1, 9]
+        hidden_state = hidden_state_cpu.unsqueeze(0).to(device)  # [1, 1024]
+        
+        # 取得視角參數
+        height_idx = int(label[0, 7].item())
+        angle_idx = int(label[0, 8].item())
+        selected_u = angle_idx / 360
+        selected_v = v_list[height_idx]
+        
+        # 生成假影像
+        z = zdist.sample((1,))
+        
+        with torch.no_grad():
+            pose = generator.sample_select_pose(selected_u, selected_v)
+            rays = generator.sample_select_rays(selected_u, selected_v)
+            rays = rays  # [2, N, 3]
+            
+            rgb_fake, _, _ = generator(z, label, hidden_state, rays=rays)
+        
+        # 將 NeRF patch 重塑為影像
+        patch_size = int(np.sqrt(rgb_fake.shape[1] // 3))
+        # rgb_fake: [1, N*3] → 先 denormalize
+        rgb_fake_img = (rgb_fake / 2 + 0.5).clamp(0, 1)
+        rgb_fake_img = rgb_fake_img.view(1, patch_size, patch_size, 3).permute(0, 3, 1, 2)  # [1, 3, H, W]
+        
+        # 真實影像 denormalize
+        img_real_01 = (img_real / 2 + 0.5).clamp(0, 1)  # [3, H, W]
+        
+        # 如果尺寸不同，將真實影像 resize 到 patch 大小
+        if img_real_01.shape[1] != patch_size:
+            img_real_resized = torch.nn.functional.interpolate(
+                img_real_01.unsqueeze(0), size=(patch_size, patch_size), 
+                mode='bilinear', align_corners=False
+            ).squeeze(0)
+        else:
+            img_real_resized = img_real_01
+        
+        # 判斷實驗名稱
+        filename = dataset.filenames[idx]
+        exp_name = 'unknown'
+        for e in dataset.exp_list:
+            if e in filename:
+                exp_name = e
+                break
+        
+        pairs.append({
+            'real': img_real_resized.cpu(),       # [3, H, W] range [0,1]
+            'fake': rgb_fake_img.squeeze(0).cpu(), # [3, H, W] range [0,1]
+            'label': label.cpu().squeeze(0),
+            'exp_name': exp_name,
+        })
+    
+    generator.train()
+    return pairs
+
+
+# ============================================================
+# 主程式
+# ============================================================
 
 if __name__ == '__main__':
-    # Arguments
-    parser = argparse.ArgumentParser(
-        description='Train a GAN with different regularization strategies.'
-    )
-    parser.add_argument('--config', default='/Data/home/vicky/graf260108_im64/results/column260119_0730_reg10_acgan_real_target_modnerf_inputlabel10_7class_skip3_BCE_lr3/config.yaml', type=str, help='Path to config file.')
+    parser = argparse.ArgumentParser(description='Evaluate GRAF model.')
+    parser.add_argument('--config', type=str, default='./results/column20260404_gru_hidden_state_disc_2/config.yaml', help='Path to config file.')
+    parser.add_argument('--checkpoint', type=str, default='./results/column20260404_gru_hidden_state_disc_2/chkpts/model_00069999.pt', help='Path to checkpoint file.')
     parser.add_argument('--fid_kid', action='store_true', help='Evaluate FID and KID.')
-    parser.add_argument('--create_sample', default= True, help='Generate videos with changing camera pose.')
-    parser.add_argument('--rotation_elevation', action='store_true', help='Generate videos with changing camera pose.')
-    parser.add_argument('--shape_appearance', action='store_true', help='Create grid image showing shape/appearance variation.')
-    parser.add_argument('--pretrained', action='store_true', help='Load pretrained model.')
-
+    parser.add_argument('--psnr_r2', action='store_true', help='Evaluate PSNR and R².')
+    parser.add_argument('--create_sample', action='store_true', help='Generate sample images.')
+    parser.add_argument('--num_pairs', type=int, default=200, help='Number of pairs for PSNR/R² evaluation.')
+    parser.add_argument('--all', default=True , action='store_true', help='Run all evaluations.')
+    
     args = parser.parse_args()
+    
+    if args.all:
+        args.fid_kid = True
+        args.psnr_r2 = True
+        args.create_sample = True
+    
     config = load_config(args.config)
     config['data']['fov'] = float(config['data']['fov'])
-
-    # Short hands
+    
     batch_size = config['training']['batch_size']
     out_dir = os.path.join(config['training']['outdir'], config['expname'])
     checkpoint_dir = path.join(out_dir, 'chkpts')
     eval_dir = os.path.join(out_dir, 'eval')
     os.makedirs(eval_dir, exist_ok=True)
-    fid_kid = int(args.fid_kid)
-
+    
     config['training']['nworkers'] = 0
-
+    
     def set_random_seed(seed):
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)  # 如果使用多 GPU
+        torch.cuda.manual_seed_all(seed)
         np.random.seed(seed)
         random.seed(seed)
-        torch.backends.cudnn.deterministic = True  # 確定性算法
-        torch.backends.cudnn.benchmark = False  # 關閉自動優化
-
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    
     set_random_seed(0)
-
-    # Logger
-    checkpoint_io = CheckpointIO(
-        checkpoint_dir=checkpoint_dir
-    )
-
+    
     device = torch.device("cuda:0")
-
-    # Dataset
-    train_dataset, hwfr = get_data(config)
-
-    config['data']['hwfr'] = hwfr         # add for building generator
-    print(train_dataset, hwfr)
     
-    val_dataset = train_dataset                 # evaluate on training dataset for GANs
-    if args.fid_kid:
-        val_loader = torch.utils.data.DataLoader(
-                val_dataset,
-                batch_size=batch_size,
-                num_workers=config['training']['nworkers'],
-                shuffle=True, pin_memory=False, sampler=None, drop_last=False,   # enable shuffle for fid/kid computation
-                generator=torch.Generator(device='cuda:0')
-        )
-
-    # Create models
+    # ========================================================
+    # [修正] 載入 GRU extractor — 原本 eval.py 缺少這段
+    # 原本直接呼叫 get_data(config) 不帶 extractor
+    # 但 Dataset 需要 extractor 來計算 hidden_state
+    # ========================================================
+    print("Loading GRU extractor...")
+    extractor_path = config['data']['extractor_path']
+    extractor_args_path = os.path.dirname(os.path.dirname(os.path.dirname(extractor_path)))
+    extractor_args = json.load(open("HystereticGRU/2026-03-24_17-13-01/args.json", "r"))
+    extractor_args = argparse.Namespace(**extractor_args)
+    extractor = importlib.import_module("graf.models.HystereticPrediction").__dict__[extractor_args.architecture](**vars(extractor_args))
+    extractor = extractor.to(device)
+    state_dict = torch.load(glob.glob(extractor_path, recursive=True)[0])["state_dict"]
+    status = extractor.load_state_dict(state_dict)
+    print(f"Extractor Loading Status: {status}")
+    
+    # ========================================================
+    # [修正] 帶上 extractor 和 extractor_args
+    # ========================================================
+    train_dataset, hwfr = get_data(config, extractor, extractor_args)
+    config['data']['hwfr'] = hwfr
+    print(f"Dataset loaded: {len(train_dataset)} images, hwfr={hwfr}")
+    
+    # 預先快取各實驗的 hidden_state
+    cached_hidden_states = {}
+    for exp_name, hs in train_dataset.hidden_state.items():
+        cached_hidden_states[exp_name] = hs.to(device)
+    print(f"Cached hidden states for: {list(cached_hidden_states.keys())}")
+    
+    val_dataset = train_dataset
+    
+    # ========================================================
+    # 建立模型
+    # ========================================================
     generator, _ = build_models(config, disc=False)
-    print('Generator params: %d' % count_trainable_parameters(generator))
-
-    # Put models on gpu if needed
+    print(f'Generator params: {count_trainable_parameters(generator)}')
     generator = generator.to(device)
-
-    # input transform
+    
     img_to_patch = ImgToPatch(generator.ray_sampler, hwfr[:3])
-
-    # Register modules to checkpoint
-    checkpoint_io.register_modules(
-        **generator.module_dict  # treat NeRF specially
-    )
-
-    # Distributions
-    zdist = get_zdist(config['z_dist']['type'], config['z_dist']['dim'],
-                      device=device)
     
-    # Evaluator
-    evaluator = Evaluator(fid_kid, generator, zdist, None,
+    checkpoint_io = CheckpointIO(checkpoint_dir=checkpoint_dir)
+    checkpoint_io.register_modules(**generator.module_dict)
+    
+    zdist = get_zdist(config['z_dist']['type'], config['z_dist']['dim'], device=device)
+    
+    evaluator = Evaluator(args.fid_kid, generator, zdist, None,
                           batch_size=batch_size, device=device)
-
-    # Train
-    tstart = t0 = time.time()
     
-    # Load checkpoint
-    load_dict = checkpoint_io.load(checkpoint_path)
+    # 載入 checkpoint
+    print(f"Loading checkpoint: {args.checkpoint}")
+    checkpoint_dir = os.path.join(out_dir, 'chkpts') 
+    checkpoint_io = CheckpointIO(checkpoint_dir=checkpoint_dir)
+    target_checkpoint = "model_00069999.pt"
+    full_checkpoint_path = os.path.join(checkpoint_dir, target_checkpoint)
+    load_dict = checkpoint_io.load(target_checkpoint)
+    # load_dict = checkpoint_io.load(args.checkpoint)
     it = load_dict.get('it', -1)
     epoch_idx = load_dict.get('epoch_idx', -1)
-
-    def create_labels(num_samples, label_value):
-        return torch.full((num_samples, 1), label_value)
+    print(f"Loaded checkpoint at iteration {it}, epoch {epoch_idx}")
+    print(f"成功載入權重: {target_checkpoint}, Iteration: {it}")
     
+    # ============================================================
+    # 1. 生成視覺化樣本
+    # ============================================================
     if args.create_sample:
+        print("\n" + "="*60)
+        print("Generating visual samples...")
+        print("="*60)
+        
         N_samples = 8
-        N_poses = 20            # corresponds to number of frames
-        render_radius = config['data']['radius']
-        if isinstance(render_radius, str):  # use maximum radius
-            render_radius = float(render_radius.split(',')[1])
-
-        # original_positions = [(0.15, 0.24),(0.29, 0.24), (0.56, 0.24), (0.71, 0.24), (0.82, 0.47), 
-        #   (0.82, 0.38), (0.82, 0.22),(0.82, 0.14)]
-        # angle_positions = [(u+0.75 , v) for u, v in original_positions] 
-        angle_positions= [(i/8+0.25, 0.5) for i in range(8)] 
-        # label = create_labels(N_samples, 1)
-
-        z = zdist.sample((N_samples,))
-
-        vec_307 = [1.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0,  0.5, 0.0]
-        vec_330 = [1.0, 0.0,  0.0, 0.0, 1.0,  1.0, 0.0,  0.5, 0.0]
-        # test_labels_list = []
-        # test_labels_list.append(vec_307)
-        test_labels_tensor = torch.tensor([vec_307] * N_samples, dtype=torch.float32).to(device)
-
-        all_rgb = []
-        for i, (u, v) in enumerate(angle_positions):
-            # position_angle = (azimuth + 180) % 360
-            print(f"處理角度位置 {i}: ({u}, {v})")
-            poses = generator.sample_select_pose(u ,v)
-            # print(poses)
-            rgb, depth, acc = evaluator.create_samples(z.to(device)[i:i+1], test_labels_tensor[i:i+1], poses.unsqueeze(0))
-            all_rgb.append(rgb)
-
-        rgb = torch.cat(all_rgb, dim=0)
-        rgb = ((rgb / 2 + 0.5).clamp(0, 1) * 255).to(torch.uint8)
-        rgb = rgb.float() / 255        
-        n_vis = 8
-        filename = 'fake_samples_307.png'
-        outpath = os.path.join(eval_dir, filename)
-        save_image(rgb, outpath, nrow=n_vis)
-
-    if args.rotation_elevation:
-        N_samples = 1
-        N_poses = 180            # corresponds to number of frames
-        render_radius = config['data']['radius']
-        if isinstance(render_radius, str):  # use maximum radius
-            render_radius = float(render_radius.split(',')[1])
-
-        # compute render poses
-        def get_render_poses_rotation_elevation(N_poses=float('inf')):
-            """Compute equidistant render poses varying azimuth and polar angle, respectively."""
-            range_theta = to_theta(0.5)
-            range_phi = (to_phi(config['data']['umin']+0.5), to_phi(config['data']['umax']+0.5))
-
-            N_phi = min(int(range_phi[1] - range_phi[0]), N_poses)  # at least 1 frame per degree
-
-            render_poses_rotation = get_render_poses(render_radius, angle_range=range_phi, theta=range_theta, N=N_phi)
-
-
-            return {'rotation': render_poses_rotation}
-
-        z = zdist.sample((N_samples,))
-        label = create_labels(N_samples, 1)
-
-        for name, poses in get_render_poses_rotation_elevation(N_poses).items():
-            outpath = os.path.join(eval_dir, '{}/'.format(name))
-            os.makedirs(outpath, exist_ok=True)
-            evaluator.make_video(outpath, z, label, poses, as_gif=False)
-            torch.cuda.empty_cache()
-    # Evaluation loop
+        angle_positions = [(i/8, 0.5) for i in range(8)]
+        
+        # 定義各實驗的 label
+        specimens = {
+            'RS307': [1.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0],
+            'RS330': [1.0, 0.0,  0.0, 0.0, 1.0,  1.0, 0.0],
+            'RS615': [0.0, 1.0,  0.0, 1.0, 0.0,  1.0, 0.0],
+        }
+        
+        for spec_name, vec in specimens.items():
+            z = zdist.sample((N_samples,))
+            
+            # [修正] 使用對應實驗的 hidden_state
+            if spec_name not in cached_hidden_states:
+                print(f"  Skipping {spec_name}: no cached hidden state")
+                continue
+            hs = cached_hidden_states[spec_name].unsqueeze(0).expand(N_samples, -1)  # [N, 1024]
+            
+            all_rgb = []
+            for i, (u, v) in enumerate(angle_positions):
+                angle = int(u * 360)
+                label_vec = vec + [0.5, float(angle)]
+                label_tensor = torch.tensor([label_vec], dtype=torch.float32).to(device)
+                hs_single = hs[i:i+1]
+                
+                pose = generator.sample_select_pose(u, v)
+                
+                # [修正] 傳入 hidden_state
+                rgb, depth, acc = evaluator.create_samples(
+                    z[i:i+1].to(device), label_tensor, hs_single, pose.unsqueeze(0)
+                )
+                all_rgb.append(rgb)
+            
+            rgb = torch.cat(all_rgb, dim=0)
+            rgb = ((rgb / 2 + 0.5).clamp(0, 1) * 255).to(torch.uint8).float() / 255
+            
+            filename = f'samples_{spec_name}_iter{it}.png'
+            outpath = os.path.join(eval_dir, filename)
+            save_image(rgb, outpath, nrow=8)
+            print(f"  Saved {spec_name} samples to {outpath}")
+    
+    # ============================================================
+    # 2. FID / KID 計算
+    # ============================================================
     if args.fid_kid:
-        # Specifically generate samples that can be saved
-        n_samples = 1000
-        ztest = zdist.sample((n_samples,))
-        samples, _, _ = evaluator.create_samples(ztest.to(device), label.to(device))
-        samples = (samples / 2 + 0.5).mul_(255).clamp_(0, 255).to(torch.uint8)      # convert to unit8
-
-        filename = 'samples_fid_kid_{:06d}.npy'.format(n_samples)
-        outpath = os.path.join(eval_dir, filename)
-        np.save(outpath, samples.numpy())
-        print('Saved {} samples to {}.'.format(n_samples, outpath))
-
-        samples = samples.to(torch.float) / 255
-
-        n_vis = 8
-        filename = 'fake_samples.png'
-        outpath = os.path.join(eval_dir, filename)
-        save_image(samples[:n_vis**2].clone(), outpath, nrow=n_vis)
-        print('Plot examples under {}.'.format(outpath))
-
-        filename = 'real_samples.png'
-        outpath = os.path.join(eval_dir, filename)
-        sample, _ = get_nsamples(val_loader, n_vis**2)
-        real = sample / 2 + 0.5
-        save_image(real[:n_vis ** 2].clone(), outpath, nrow=n_vis)
-        print('Plot examples under {}.'.format(outpath))
-
-        # Compute FID and KID
-        fid_cache_file = os.path.join(out_dir, 'fid_cache_train.npz')
-        kid_cache_file = os.path.join(out_dir, 'kid_cache_train.npz')
-        evaluator.inception_eval.initialize_target(val_loader, cache_file=fid_cache_file, act_cache_file=kid_cache_file)
-
-        samples = samples * 2 - 1
-        sample_loader = torch.utils.data.DataLoader(
-            samples,
-            batch_size=evaluator.batch_size, num_workers=config['training']['nworkers'],
-            shuffle=False, pin_memory=False, sampler=None, drop_last=False,
+        print("\n" + "="*60)
+        print("Computing FID and KID...")
+        print("="*60)
+        
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            num_workers=0,
+            shuffle=True,
+            pin_memory=False,
+            drop_last=False,
             generator=torch.Generator(device='cuda:0')
         )
-        fid, kid = evaluator.compute_fid_kid(label, sample_loader)
-
-        filename = 'fid_kid.csv'
+        
+        # ========================================================
+        # [修正] FID/KID 計算流程
+        #
+        # 原本 eval.py 的問題：
+        # 1. 先生成 1000 張假圖存成 numpy
+        # 2. 再用 DataLoader 包起來
+        # 3. 呼叫 evaluator.compute_fid_kid(label, sample_loader)
+        #    → 但 compute_fid_kid 的簽名是 (real_label, hidden_state, sample_generator)
+        #    → sample_loader 被當成 hidden_state 傳入！
+        #
+        # 正確做法：
+        # 1. 用 evaluator.inception_eval.initialize_target() 計算真實圖的統計量
+        # 2. 用 evaluator.compute_fid_kid() 內建的 sample generator 生成假圖
+        #    → 它會自動呼叫 create_samples 並計算 Inception 特徵
+        #
+        # 但 compute_fid_kid 使用固定的 real_label 和 hidden_state
+        # 這代表所有假圖都使用同一組條件，FID 只衡量該條件下的品質
+        # 更好的做法：隨機抽取不同條件來計算
+        # ========================================================
+        
+        # Step 1: 計算真實圖的 Inception 特徵統計量
+        fid_cache_file = os.path.join(out_dir, 'fid_cache_train.npz')
+        kid_cache_file = os.path.join(out_dir, 'kid_cache_train.npz')
+        evaluator.inception_eval.initialize_target(
+            val_loader, cache_file=fid_cache_file, act_cache_file=kid_cache_file
+        )
+        
+        # Step 2: 用各實驗的條件計算 FID/KID，然後取平均
+        fid_results = {}
+        kid_results = {}
+        
+        for spec_name, hs in cached_hidden_states.items():
+            # 找到該實驗對應的 label
+            spec_key = spec_name + '_n'
+            if spec_key in train_dataset.specimen_props:
+                props = train_dataset.specimen_props[spec_key]
+                label_vec = props['AR'] + props['LR'] + props['TR']
+            else:
+                print(f"  Warning: {spec_key} not in specimen_props, skipping")
+                continue
+            
+            label_tensor = torch.tensor([label_vec], dtype=torch.float32).to(device)
+            hs_tensor = hs.unsqueeze(0).to(device)  # [1, 1024]
+            
+            print(f"  Computing FID/KID for {spec_name}...")
+            fid, kid = evaluator.compute_fid_kid(label_tensor, hs_tensor)
+            fid_results[spec_name] = fid
+            kid_results[spec_name] = kid
+            print(f"    FID={fid:.2f}, KID×100={kid*100:.2f}")
+            torch.cuda.empty_cache()
+        
+        # 計算平均
+        avg_fid = np.mean(list(fid_results.values()))
+        avg_kid = np.mean(list(kid_results.values()))
+        
+        print(f"\n  Average FID: {avg_fid:.2f}")
+        print(f"  Average KID×100: {avg_kid*100:.2f}")
+        
+        # 儲存結果
+        filename = f'fid_kid_iter{it}.csv'
         outpath = os.path.join(eval_dir, filename)
-        with open(outpath, mode='w') as csv_file:
-            fieldnames = ['fid', 'kid']
-            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-
-            writer.writeheader()
-            writer.writerow({'fid': fid, 'kid': kid})
-
-        print('Saved FID ({:.1f}) and KIDx100 ({:.2f}) to {}.'.format(fid, kid*100, outpath))
+        with open(outpath, mode='w', newline='') as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(['experiment', 'fid', 'kid', 'kid_x100'])
+            for spec_name in fid_results:
+                writer.writerow([spec_name, f"{fid_results[spec_name]:.4f}", 
+                               f"{kid_results[spec_name]:.6f}", f"{kid_results[spec_name]*100:.4f}"])
+            writer.writerow(['AVERAGE', f"{avg_fid:.4f}", f"{avg_kid:.6f}", f"{avg_kid*100:.4f}"])
+        print(f"  Saved to {outpath}")
+    
+    # ============================================================
+    # 3. PSNR / R² / SSIM 計算
+    # ============================================================
+    if args.psnr_r2:
+        print("\n" + "="*60)
+        print(f"Computing PSNR, R², SSIM ({args.num_pairs} pairs)...")
+        print("="*60)
+        
+        # 生成配對樣本
+        pairs = generate_paired_samples(
+            generator, evaluator, train_dataset, zdist,
+            cached_hidden_states, device,
+            num_pairs=args.num_pairs, seed=42
+        )
+        
+        # 按實驗分組計算指標
+        metrics_by_exp = {}
+        all_psnr = []
+        all_r2 = []
+        all_ssim = []
+        
+        for pair in pairs:
+            real = pair['real']   # [3, H, W] range [0,1]
+            fake = pair['fake']   # [3, H, W] range [0,1]
+            exp_name = pair['exp_name']
+            
+            psnr_val = compute_psnr(fake, real)
+            r2_val = compute_r_squared(fake, real)
+            ssim_val = compute_ssim(fake, real)
+            
+            if exp_name not in metrics_by_exp:
+                metrics_by_exp[exp_name] = {'psnr': [], 'r2': [], 'ssim': []}
+            
+            metrics_by_exp[exp_name]['psnr'].append(psnr_val)
+            metrics_by_exp[exp_name]['r2'].append(r2_val)
+            metrics_by_exp[exp_name]['ssim'].append(ssim_val)
+            
+            all_psnr.append(psnr_val)
+            all_r2.append(r2_val)
+            all_ssim.append(ssim_val)
+        
+        # 印出結果
+        print(f"\n{'Experiment':<12} {'PSNR (dB)':<12} {'R²':<12} {'SSIM':<12} {'Count':<8}")
+        print("-" * 56)
+        
+        for exp_name in sorted(metrics_by_exp.keys()):
+            m = metrics_by_exp[exp_name]
+            print(f"{exp_name:<12} "
+                  f"{np.mean(m['psnr']):>8.2f}±{np.std(m['psnr']):.2f}  "
+                  f"{np.mean(m['r2']):>8.4f}±{np.std(m['r2']):.4f}  "
+                  f"{np.mean(m['ssim']):>8.4f}±{np.std(m['ssim']):.4f}  "
+                  f"{len(m['psnr']):>4}")
+        
+        print("-" * 56)
+        print(f"{'OVERALL':<12} "
+              f"{np.mean(all_psnr):>8.2f}±{np.std(all_psnr):.2f}  "
+              f"{np.mean(all_r2):>8.4f}±{np.std(all_r2):.4f}  "
+              f"{np.mean(all_ssim):>8.4f}±{np.std(all_ssim):.4f}  "
+              f"{len(all_psnr):>4}")
+        
+        # 儲存 CSV
+        filename = f'psnr_r2_ssim_iter{it}.csv'
+        outpath = os.path.join(eval_dir, filename)
+        with open(outpath, mode='w', newline='') as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(['experiment', 'psnr_mean', 'psnr_std', 'r2_mean', 'r2_std', 
+                           'ssim_mean', 'ssim_std', 'count'])
+            for exp_name in sorted(metrics_by_exp.keys()):
+                m = metrics_by_exp[exp_name]
+                writer.writerow([
+                    exp_name,
+                    f"{np.mean(m['psnr']):.4f}", f"{np.std(m['psnr']):.4f}",
+                    f"{np.mean(m['r2']):.6f}", f"{np.std(m['r2']):.6f}",
+                    f"{np.mean(m['ssim']):.6f}", f"{np.std(m['ssim']):.6f}",
+                    len(m['psnr'])
+                ])
+            writer.writerow([
+                'OVERALL',
+                f"{np.mean(all_psnr):.4f}", f"{np.std(all_psnr):.4f}",
+                f"{np.mean(all_r2):.6f}", f"{np.std(all_r2):.6f}",
+                f"{np.mean(all_ssim):.6f}", f"{np.std(all_ssim):.6f}",
+                len(all_psnr)
+            ])
+        print(f"\n  Saved to {outpath}")
+        
+        # 儲存逐筆數據
+        filename_detail = f'psnr_r2_ssim_detail_iter{it}.csv'
+        outpath_detail = os.path.join(eval_dir, filename_detail)
+        with open(outpath_detail, mode='w', newline='') as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(['index', 'experiment', 'psnr', 'r2', 'ssim'])
+            for i, pair in enumerate(pairs):
+                exp_name = pair['exp_name']
+                m = metrics_by_exp[exp_name]
+                idx_in_exp = len([p for p in pairs[:i] if p['exp_name'] == exp_name])
+                writer.writerow([
+                    i, exp_name,
+                    f"{m['psnr'][idx_in_exp]:.4f}",
+                    f"{m['r2'][idx_in_exp]:.6f}",
+                    f"{m['ssim'][idx_in_exp]:.6f}"
+                ])
+        print(f"  Saved detail data to {outpath_detail}")
+        
+        # ========================================================
+        # 繪製視覺化對比圖
+        # ========================================================
+        print("\n  Generating comparison plots...")
+        compare_dir = os.path.join(eval_dir, 'comparisons')
+        os.makedirs(compare_dir, exist_ok=True)
+        
+        # 選取每個實驗的前 4 張做對比
+        for exp_name in sorted(metrics_by_exp.keys()):
+            exp_pairs = [p for p in pairs if p['exp_name'] == exp_name]
+            n_show = min(4, len(exp_pairs))
+            
+            fig, axes = plt.subplots(2, n_show, figsize=(4*n_show, 8))
+            fig.suptitle(f'{exp_name} — Real vs Generated', fontsize=16)
+            
+            for j in range(n_show):
+                real_img = exp_pairs[j]['real'].permute(1, 2, 0).numpy()  # [H, W, 3]
+                fake_img = exp_pairs[j]['fake'].permute(1, 2, 0).numpy()
+                
+                psnr_j = compute_psnr(exp_pairs[j]['fake'], exp_pairs[j]['real'])
+                r2_j = compute_r_squared(exp_pairs[j]['fake'], exp_pairs[j]['real'])
+                
+                if n_show == 1:
+                    ax_real = axes[0]
+                    ax_fake = axes[1]
+                else:
+                    ax_real = axes[0, j]
+                    ax_fake = axes[1, j]
+                
+                ax_real.imshow(np.clip(real_img, 0, 1))
+                ax_real.set_title('Real')
+                ax_real.axis('off')
+                
+                ax_fake.imshow(np.clip(fake_img, 0, 1))
+                ax_fake.set_title(f'Gen (PSNR={psnr_j:.1f}, R²={r2_j:.3f})')
+                ax_fake.axis('off')
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(compare_dir, f'compare_{exp_name}.png'), dpi=150)
+            plt.close()
+        
+        print(f"  Saved comparison plots to {compare_dir}/")
+        
+        # ========================================================
+        # 繪製指標分佈圖
+        # ========================================================
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        
+        # PSNR 分佈
+        for exp_name in sorted(metrics_by_exp.keys()):
+            axes[0].hist(metrics_by_exp[exp_name]['psnr'], alpha=0.5, label=exp_name, bins=20)
+        axes[0].set_xlabel('PSNR (dB)')
+        axes[0].set_ylabel('Count')
+        axes[0].set_title('PSNR Distribution')
+        axes[0].legend()
+        
+        # R² 分佈
+        for exp_name in sorted(metrics_by_exp.keys()):
+            axes[1].hist(metrics_by_exp[exp_name]['r2'], alpha=0.5, label=exp_name, bins=20)
+        axes[1].set_xlabel('R²')
+        axes[1].set_ylabel('Count')
+        axes[1].set_title('R² Distribution')
+        axes[1].legend()
+        
+        # SSIM 分佈
+        for exp_name in sorted(metrics_by_exp.keys()):
+            axes[2].hist(metrics_by_exp[exp_name]['ssim'], alpha=0.5, label=exp_name, bins=20)
+        axes[2].set_xlabel('SSIM')
+        axes[2].set_ylabel('Count')
+        axes[2].set_title('SSIM Distribution')
+        axes[2].legend()
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(eval_dir, f'metrics_distribution_iter{it}.png'), dpi=150)
+        plt.close()
+        print(f"  Saved distribution plot to {eval_dir}/metrics_distribution_iter{it}.png")
+    
+    print("\n" + "="*60)
+    print("Evaluation complete!")
+    print("="*60)

@@ -1,27 +1,26 @@
-expname: column260326_tanh_latentcodes_modloss_ccsr_gru
+expname: column20260404_gru_hidden_state_disc_2
 data:
-  datadir: [data/RS307_n, data/RS330_n, data/RS615_n] #, data/RS315_n , data/RS615_n
+  datadir: [data/RS307_n, data/RS330_n, data/RS615_n]
   extractor_path: /Data/home/vicky/graf260108_im64/HystereticGRU/2026-03-24_17-13-01/Opensees Based damage Patterns Generation/c7d0zrxf/checkpoints/best.ckpt
   far: 4.5
   fov: 20
   imsize: 256  
   near: 1.5
   orthographic: False
-  use_default_rays : False
+  use_default_rays: False
   radius: 2.5
   type: RS307_0_i2
   umax: 1.
   umin: 0.
   vmax: 0.5
   vmin: 0.
-  # v: 0.5, 0.4166667, 0.3833333, 0.3333334, 0.25, 0.21666667  #, 0.1666667, 0.1166667
-  # v: 0.5, 0.4166667, 0.3333334, 0.25  #, 0.1666667  #90 80.406 70.529 60 48.19   0.5, 0.4, 0.3, 0.2
-  # v: 0.5, 0.36, 0.4, 0.3, 0.2, 0.16, 0.1
   v: 0.5, 0.4, 0.3, 0.2 
 discriminator:
-  num_classes: 7   
+  # [變更] 移除了 num_classes，改用 hidden_state 條件
   hflip: false
-  ndf: 64 #64 #128
+  ndf: 64
+  hidden_dim: 1024    # GRU hidden state 維度
+  cond_dim: 256        # 投影後的條件通道數
 nerf:
   N_samples: 64
   decrease_noise: true
@@ -38,14 +37,14 @@ nerf:
   netwidth_fine: 256
   num_classes: 12
 ray_sampler:
-  N_samples: 4096 #1024 #4096
+  N_samples: 4096
   max_scale: 1.0
   min_scale: 0.25
   scale_anneal: 0.0025
 training:
   backup_every: 50000
   batch_size: 8
-  chunk: 32768 #131072
+  chunk: 32768
   equalize_lr: false
   fid_every: 5000
   gan_type: standard
@@ -56,7 +55,7 @@ training:
   model_average_beta: 0.999
   model_average_reinit: false
   model_file: model.pt
-  netchunk: 65536 #262144
+  netchunk: 65536
   nworkers: 0
   optimizer: rmsprop
   outdir: ./results
@@ -69,15 +68,14 @@ training:
   take_model_average: true
 z_dist:
   dim: 256
-  # dim_appearance: 128 
   type: gauss
 ccsr: 
-    enabled: True,
-    num_views: 8,
-    scale_factor: 1,
-    alpha_init: 1.0,
-    alpha_decay: 0.0001
+  enabled: false
+  num_views: 8
+  scale_factor: 1
+  alpha_init: 1.0
+  alpha_decay: 0.0001
 wandb:
   project: graf260108
   entity: vicky20020808
-  name: tanh_latent_codes_modloss_ccsr_gru
+  name: column20260404_gru_hidden_state_disc

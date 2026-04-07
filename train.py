@@ -18,13 +18,11 @@ import torchvision.utils as vutils
 from graf.gan_training import Evaluator
 from graf.config import get_data, build_models, load_config, save_config, build_lr_scheduler
 from graf.utils import get_zdist
-from graf.train_step import compute_grad2, compute_loss, save_data, wgan_gp_reg, toggle_grad, MCE_Loss, CCSRLoss
+from graf.train_step import compute_grad2, compute_loss, toggle_grad
 from graf.transforms import ImgToPatch
-# from graf.models.vit_model import ViewConsistencyTransformer
- 
+
 from GAN_stability.gan_training.checkpoints_mod import CheckpointIO
 
-# os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 
 def setup_directories(config):
     out_dir = os.path.join(config['training']['outdir'], config['expname'])
@@ -34,8 +32,6 @@ def setup_directories(config):
     return out_dir, checkpoint_dir
 
 def initialize_training(config, device):
-    # dataset
-        # Load extractor
     extractor_path = config['data']['extractor_path']
     extractor_args = json.load(open(glob.glob("/Data/home/vicky/graf260108_im64/HystereticGRU/2026-03-24_17-13-01/args.json", recursive=True)[0], "r"))
     extractor_args = argparse.Namespace(**extractor_args)
@@ -46,24 +42,13 @@ def initialize_training(config, device):
     status = extractor.load_state_dict(state_dict)
     print("Extractor Loading Status: ", status)
 
-    train_dataset, hwfr= get_data(config, extractor, extractor_args)
-
-    # print("=== Label Check ===")
-    # print(f"Total images: {len(train_dataset)}")
-    # # 隨機印出 10 個檔案的 Label
-    # import random
-    # for _ in range(10):
-    #     idx = random.randint(0, len(train_dataset)-1)
-    #     img, lbl = train_dataset[idx]
-    #     print(f"File: {train_dataset.filenames[idx]}, Label: {lbl}")
-    # print("===================")
+    train_dataset, hwfr = get_data(config, extractor, extractor_args)
 
     if config['data']['orthographic']:
         hw_ortho = (config['data']['far']-config['data']['near'],) * 2
         hwfr[2] = hw_ortho
     config['data']['hwfr'] = hwfr
     
-    # train_loader
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=config['training']['batch_size'],
@@ -75,20 +60,19 @@ def initialize_training(config, device):
         generator=torch.Generator(device='cuda:0')
     )
     
-    # Create models
     generator, discriminator = build_models(config)
     generator = generator.to(device)
     discriminator = discriminator.to(device)
-    return train_loader, generator, discriminator
+    return train_loader, train_dataset, generator, discriminator
 
 def set_random_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)  # 如果使用多 GPU
+    torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
-    torch.backends.cudnn.deterministic = True  # 確定性算法
-    torch.backends.cudnn.benchmark = False  # 關閉自動優化
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def main():
     set_random_seed(0)
@@ -96,31 +80,25 @@ def main():
     parser.add_argument('--config', default='configs/default.yaml')
     args = parser.parse_args()
 
-    # load config
     config = load_config(args.config)
     config['data']['fov'] = float(config['data']['fov'])
     restart_every = config['training']['restart_every']
-    batch_size=config['training']['batch_size']
+    batch_size = config['training']['batch_size']
     fid_every = config['training']['fid_every']
     save_best = config['training']['save_best']
     reg_param = config['training']['reg_param']
     device = torch.device("cuda:0")
     
-    # 創建目錄
     out_dir, checkpoint_dir = setup_directories(config)
     save_config(os.path.join(out_dir, 'config.yaml'), config)
     
-    # 初始化 wandb
     wandb.init(
         project=config['wandb']['project'],
         name=config['wandb']['name'],
         config=config
     )
 
-    # 初始化model
-    train_loader, generator, discriminator = initialize_training(config, device) #, qhead, dhead 
-
-    ccsr_loss = CCSRLoss().to(device)
+    train_loader, train_dataset, generator, discriminator = initialize_training(config, device)
 
     file_path = os.path.join(out_dir, "model_architecture.txt")
     with open(file_path, 'w') as f:
@@ -131,24 +109,18 @@ def main():
         f.write('Generator Architecture:\n')
         f.write('-' * 50 + '\n')
         pprint.pprint(generator.module_dict, stream=f)
-
     wandb.save(file_path)
 
-    # 優化器
     lr_g = config['training']['lr_g']
     lr_d = config['training']['lr_d']
     g_params = generator.parameters()
     d_params = discriminator.parameters()
     g_optimizer = optim.RMSprop(g_params, lr=lr_g, alpha=0.99, eps=1e-8)
     d_optimizer = optim.RMSprop(d_params, lr=lr_d, alpha=0.99, eps=1e-8)
-    # g_optimizer = optim.Adam(g_params, lr=lr_g, betas=(0.5, 0.999), eps=1e-8)
-    # d_optimizer = optim.Adam(d_params, lr=lr_d, betas=(0.5, 0.999), eps=1e-8)
 
-    #get patch
     hwfr = config['data']['hwfr']
     img_to_patch = ImgToPatch(generator.ray_sampler, hwfr[:3])
     
-    # 設置檢查點
     checkpoint_io = CheckpointIO(checkpoint_dir=checkpoint_dir)
     checkpoint_io.register_modules(
         discriminator=discriminator,
@@ -159,7 +131,6 @@ def main():
     
     zdist = get_zdist(config['z_dist']['type'], config['z_dist']['dim'], device=device)
 
-    # Evaluator
     evaluator = Evaluator(fid_every > 0, generator, zdist, None,
                           batch_size=batch_size, device=device, inception_nsamples=33)
     val_loader = train_loader
@@ -168,6 +139,12 @@ def main():
         kid_cache_file = os.path.join(out_dir, 'kid_cache_train.npz')
         evaluator.inception_eval.initialize_target(val_loader, cache_file=fid_cache_file, act_cache_file=kid_cache_file)
     
+    # 預先快取各實驗的 hidden_state
+    cached_hidden_states = {}
+    for exp_name, hs in train_dataset.hidden_state.items():
+        cached_hidden_states[exp_name] = hs.to(device)
+    print(f"Cached hidden states for: {list(cached_hidden_states.keys())}")
+
     fid_best = float('inf')
     kid_best = float('inf')
     
@@ -176,23 +153,26 @@ def main():
     
     g_scheduler = build_lr_scheduler(g_optimizer, config, last_epoch=it)
     d_scheduler = build_lr_scheduler(d_optimizer, config, last_epoch=it)
-    config['training']['lr_g'] = lr_g
-    config['training']['lr_d'] = lr_d
 
-    n_each_task = [2, 3, 2] 
-    criterion_cls = MCE_Loss().to(device)
-    # criterion_label = nn.MSELoss().to(device)
-    lambda_cls_d = 1.0
-    lambda_cls_g = 1.0
+    # ========================================================
+    # [變更] 移除了:
+    # - MCE_Loss / criterion_cls（不再做分類）
+    # - n_each_task（不再需要）
+    # - lambda_cls_d / lambda_cls_g（不再需要）
+    # - CCSRLoss（如果你也不需要 CCSR 的話）
+    #
+    # Discriminator 現在只做真假判別，
+    # 條件資訊完全透過 hidden_state 注入
+    # ========================================================
 
     while True:
         epoch_idx += 1
         for x_real, label, hidden_state in tqdm(train_loader, desc=f"Epoch {epoch_idx}"):
             it += 1
 
-            # criterion_cls = torch.nn.CrossEntropyLoss().to(device)
-            # criterion_cls = torch.nn.BCEWithLogitsLoss().to(device)
-            real_cls_labels = label[:, :7].float().to(device)
+            x_real = x_real.to(device)
+            label = label.to(device)
+            hidden_state = hidden_state.to(device)
 
             generator.ray_sampler.iterations = it
             toggle_grad(generator, False)
@@ -200,51 +180,40 @@ def main():
             generator.train()
             discriminator.train()
 
-            # Discriminator updates
+            # ========== Discriminator Step ==========
             d_optimizer.zero_grad()
 
-            x_real = x_real.to(device)
             rgbs = img_to_patch(x_real)
             rgbs.requires_grad_(True)
 
             z = zdist.sample((batch_size,))
             
-            #real data
-            d_real, label_real_pred = discriminator(rgbs, label)
-            dloss_real = compute_loss(d_real, (0.9, 1.0))
-            # dloss_real = compute_loss(d_real, 1)
-            # d_class_loss = criterion_cls(label_real_pred, real_cls_labels)
-            d_class_loss = criterion_cls(n_each_task, label_real_pred, real_cls_labels)
+            # ========================================================
+            # [變更] discriminator 改為接收 hidden_state 而非 label
+            # 原本: d_real, label_pred = discriminator(rgbs, label)
+            # 現在: d_real = discriminator(rgbs, hidden_state)
+            # 回傳值只有真假判別分數，不再有分類預測
+            # ========================================================
+            
+            # Real
+            d_real = discriminator(rgbs, hidden_state)
+            dloss_real = compute_loss(d_real, 1)
             reg = reg_param * compute_grad2(d_real, rgbs).mean()
             
-            #fake data
+            # Fake
             with torch.no_grad():
                 x_fake, _ = generator(z, label, hidden_state)
             x_fake.requires_grad_()
+            
+            d_fake = discriminator(x_fake, hidden_state)
+            dloss_fake = compute_loss(d_fake, 0)
 
-            d_fake, _ = discriminator(x_fake, label)
-            dloss_fake = compute_loss(d_fake, (0.0, 0.1))
-
-            # 新增：針對 CCSR 輸出的判別 (Fake data from CCSR)
-            with torch.no_grad():
-                # 獲取 CCSR 提升後的 Patch [B, 3, 64, 64]
-                _, _, ccsr_output_d = generator(z, label, hidden_state, return_ccsr_output=True)
-            # # 將 [B, 3, 64, 64] 轉回 Discriminator 期望的 [B*N, 3] 格式
-            # # 注意：ccsr_output_d 需先轉置為 [B, 64, 64, 3] 再 reshape
-            ccsr_patch_for_d = ccsr_output_d.permute(0, 2, 3, 1).reshape(-1, 3)
-            ccsr_patch_for_d.requires_grad_()
-
-            d_ccsr, _ = discriminator(ccsr_patch_for_d, label)
-            dloss_ccsr = compute_loss(d_ccsr, (0.0, 0.1))
-
-            total_d_loss = dloss_real + (dloss_fake + dloss_ccsr) / 2 + reg + (d_class_loss * lambda_cls_d) #(dloss_fake + dloss_ccsr) / 2
-            # total_d_loss = dloss_real + dloss_fake + reg + (d_class_loss * lambda_cls_d)
-            # total_d_loss = dloss_real + dloss_fake + reg
+            total_d_loss = dloss_real + dloss_fake + reg
             total_d_loss.backward()
             d_optimizer.step()
             d_scheduler.step()
 
-            # Generators updates
+            # ========== Generator Step ==========
             if config['nerf']['decrease_noise']:
                 generator.decrease_nerf_noise(it)
 
@@ -255,99 +224,59 @@ def main():
             g_optimizer.zero_grad()
 
             z = zdist.sample((batch_size,))
-            # x_fake, _= generator(z, label)
-            x_fake, _, ccsr_output = generator(z, label, hidden_state, return_ccsr_output=True)
-            d_fake, label_fake_pred = discriminator(x_fake, label)
+            x_fake, _ = generator(z, label, hidden_state)
+            
+            d_fake = discriminator(x_fake, hidden_state)
             gloss = compute_loss(d_fake, 1)
 
-            ccsr_patch_for_g = ccsr_output.permute(0, 2, 3, 1).reshape(-1, 3)
-            d_ccsr_fake, _ = discriminator(ccsr_patch_for_g, label)
-            gloss_ccsr = compute_loss(d_ccsr_fake, 1)
-
-            # g_class_loss = criterion_cls(label_fake_pred, real_cls_labels) 
-            g_class_loss = criterion_cls(n_each_task, label_fake_pred, real_cls_labels)
-            # ccsr_consistency_loss = ccsr_nerf_loss(ccsr_output, x_fake)
-
-            ccsr_patch_loss = ccsr_loss(ccsr_output, rgbs.view(batch_size, 3, 64, 64))
-
-            gloss_all = (gloss + gloss_ccsr)/2  + (g_class_loss * lambda_cls_g) + 1.0 * ccsr_patch_loss #  (gloss + gloss_ccsr)/2
-            # gloss_all = gloss  + (g_class_loss * lambda_cls_g) #+ ccsr_consistency_loss
-            # gloss_all = gloss   #+ ccsr_consistency_loss
-
-            gloss_all.backward()
+            gloss.backward()
             g_optimizer.step()
             g_scheduler.step()
 
             current_lr_g = g_optimizer.param_groups[0]['lr']
             current_lr_d = d_optimizer.param_groups[0]['lr']
-            # wandb
+            
             if (it + 1) % config['training']['print_every'] == 0:
                 wandb.log({
                     "loss/generator": gloss,
-                    "loss/gloss_ccsr": gloss_ccsr,
-                    "loss/glabel": g_class_loss,
-                    "loss/ccsr": ccsr_patch_loss,
-                    "loss/generator_total": gloss_all,
                     "loss/discriminator": total_d_loss,
-                    "loss/dloss_ccsr": dloss_ccsr,
+                    "loss/dloss_real": dloss_real,
                     "loss/dloss_fake": dloss_fake,
-                    "loss/dlabel": d_class_loss,
                     "loss/regularizer": reg,
                     "learning rate/generator": current_lr_g,
                     "learning rate/discriminator": current_lr_d,
                     "iteration": it
                 })
-            
-            # 在需要儲存資料的位置，例如在訓練迴圈中特定迭代次數時
-            # if (it % 6000 == 0):
-            #     # 在這裡使用當前的 label 和 rays
-            #     save_data(label, rays, it, save_dir=os.path.join(out_dir, 'saved_data'))
 
-            # (ii) Sample if necessary
+            # Sample
             if ((it % config['training']['sample_every']) == 0) or ((it < 500) and (it % 100 == 0)):
-                # is_training = generator.use_test_kwargs
-                # generator.eval()  
                 plist = []
                 angle_positions = [(i/8, 0.5) for i in range(8)] 
                 ztest = zdist.sample((batch_size,))
-                # label_test = torch.tensor([[0] if i < 4 else [0] for i in range(batch_size)])
 
                 vec_307 = [1.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0]
-                vec_330 = [1.0, 0.0,  0.0, 0.0, 1.0,  1.0, 0.0]
-                # vec_307 = [0.742/2.889, 1.282/1.282]
-                # vec_330 = [2.889/2.889, 1.106/1.282]
-                test_labels_list = []
-                for i in range(batch_size):
-                    if i < batch_size // 2:
-                        test_labels_list.append(vec_307)
-                    else:
-                        test_labels_list.append(vec_307)
-                label_test = torch.tensor(test_labels_list, dtype=torch.float32).to(device)
-
-                # save_dir = os.path.join(out_dir, 'poses')
-                # os.makedirs(save_dir, exist_ok=True)
 
                 for i, (u, v) in enumerate(angle_positions):
-                    # print(f"指定角度:{u}, 轉換後角度:{position_angle}")
-                    poses = generator.sample_select_pose(u ,v)
+                    poses = generator.sample_select_pose(u, v)
                     plist.append(poses)
                 ptest = torch.stack(plist)
 
                 angles = [0, 45, 90, 135, 180, 225, 270, 315]
                 test_labels_list = []
                 for angle in angles:
-                    label = vec_307 + [0.5, float(angle)]
-                    test_labels_list.append(label)
-
+                    lbl = vec_307 + [0.5, float(angle)]
+                    test_labels_list.append(lbl)
                 label_test_all = torch.tensor(test_labels_list, dtype=torch.float32).to(device)
 
-                rgb, depth, acc = evaluator.create_samples(ztest.to(device), label_test_all, hidden_state, ptest)
+                hs_307 = cached_hidden_states['RS307']
+                hs_test = hs_307.unsqueeze(0).expand(8, -1)
+
+                rgb, depth, acc = evaluator.create_samples(ztest.to(device), label_test_all, hs_test, ptest)
 
                 grid_rgb = vutils.make_grid(rgb.detach().cpu(), nrow=8, normalize=True)
                 grid_depth = vutils.make_grid(depth.detach().cpu(), nrow=8, normalize=True)
                 grid_acc = vutils.make_grid(acc.detach().cpu(), nrow=8, normalize=True)
                 
-        
                 wandb.log({
                     "sample/rgb": [wandb.Image(grid_rgb, caption=f"RGB at iter {it}")],
                     "sample/depth": [wandb.Image(grid_depth, caption=f"Depth at iter {it}")],
@@ -356,38 +285,32 @@ def main():
                     "iteration": it
                 })
 
-             # (v) Compute fid if necessary
+            # FID/KID
             if fid_every > 0 and ((it + 1) % fid_every) == 0:
                 fid, kid = evaluator.compute_fid_kid(label, hidden_state)
                 wandb.log({
-                        "validation/fid": fid,
-                        "validation/kid": kid,
-                        "iteration": it
-                    })
+                    "validation/fid": fid,
+                    "validation/kid": kid,
+                    "iteration": it
+                })
                 torch.cuda.empty_cache()
-                # save best model
                 if save_best == 'fid' and fid < fid_best:
                     fid_best = fid
                     print('Saving best model based on FID...')
-                    wandb.run.summary["best_fid"] = fid_best  # 更新 summary
+                    wandb.run.summary["best_fid"] = fid_best
                     checkpoint_io.save('model_best.pt', it=it, epoch_idx=epoch_idx, fid_best=fid_best, kid_best=kid_best, save_to_wandb=True)
-                    # logger.save_stats('stats_best.p')
                     torch.cuda.empty_cache()
-                
                 elif save_best == 'kid' and kid < kid_best:
                     kid_best = kid
                     print('Saving best model based on KID...')
-                    wandb.run.summary["best_kid"] = kid_best  # 更新 summary
+                    wandb.run.summary["best_kid"] = kid_best
                     checkpoint_io.save('model_best.pt', it=it, epoch_idx=epoch_idx, fid_best=fid_best, kid_best=kid_best, save_to_wandb=True)
-                    # logger.save_stats('stats_best.p')
                     torch.cuda.empty_cache()
 
-            # (i) Backup if necessary
             if ((it + 1) % 10000) == 0:
                 print('Saving backup...')
                 checkpoint_io.save('model_%08d.pt' % it, it=it, epoch_idx=epoch_idx, save_to_wandb=True)
 
-            # 儲存檢查點
             if time.time() - t0 > config['training']['save_every']:
                 checkpoint_io.save(
                     config['training']['model_file'], 
