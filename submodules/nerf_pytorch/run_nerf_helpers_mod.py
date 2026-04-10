@@ -64,7 +64,8 @@ def get_embedder(multires, i=0):
 
 # Model
 class NeRF(nn.Module):
-    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False, numclasses=4, cond=True):
+    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3,
+                 output_ch=4, skips=[4], use_viewdirs=False, **kwargs):
         super(NeRF, self).__init__()
         self.D = D
         self.W = W
@@ -72,24 +73,21 @@ class NeRF(nn.Module):
         self.input_ch_views = input_ch_views
         self.skips = skips
         self.use_viewdirs = use_viewdirs
-        self.numclasses = numclasses
-        
+
         self.pts_linears = nn.ModuleList(
-            [nn.Linear(input_ch+W, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch+W, W) for i in range(D-1)])
-        
+            [nn.Linear(input_ch + W, W)] +
+            [nn.Linear(W, W) if i not in self.skips
+             else nn.Linear(W + input_ch + W, W) for i in range(D-1)]
+        )
         self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W//2)])
 
-        self.condition_embedding = nn.Sequential(
-                nn.Linear(numclasses, W), 
-                nn.LayerNorm(W),
-                nn.ReLU(),
-                nn.Linear(W, W)
-                )
-        
-        # condition_feature: 1024 → W (256)
-        # 在 run_network 中被提前呼叫以減少記憶體
+        # ========================================================
+        # [移除] condition_embedding 從未被呼叫,刪掉
+        # ========================================================
+
+        # 共享給 D 用 — 1024 → W (=256)
         self.condition_feature = nn.Linear(1024, W)
-            
+
         if use_viewdirs:
             self.feature_linear = nn.Linear(W, W)
             self.alpha_linear = nn.Linear(W, 1)
@@ -97,45 +95,21 @@ class NeRF(nn.Module):
         else:
             self.output_linear = nn.Linear(W, output_ch)
 
-    def forward(self, x, label, hidden_state):
-        input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
-        h = input_pts
-
-        label = label.to(input_pts.device)
+    def forward(self, x, hidden_state):
+        """
+        x: [N_pts, input_ch + W]  (positional encoding + projected features)
+        hidden_state: [N_pts, W]  (已經由 run_network 預先投影)
+        """
+        input_pts, input_views = torch.split(
+            x, [self.input_ch, self.input_ch_views], dim=-1
+        )
         hidden_state = hidden_state.to(input_pts.device)
 
-        # ========================================================
-        # [修正4] 修正變數名稱：label 結構是 [AR(2), LR(3), TR(2)]
-        # 原本 tr_idx 和 lr_idx 的名稱寫反了
-        # 雖然 class_idx 的最終計算結果是正確的（一對一映射），
-        # 但變數名應該要和實際對應的屬性一致
-        # ========================================================
-        # ar_idx = label[:, :2].argmax(dim=-1)     # AR: Aspect Ratio，2 類
-        # lr_idx = label[:, 2:5].argmax(dim=-1)    # LR: Longitudinal Reinforcement Ratio，3 類
-        # tr_idx = label[:, 5:7].argmax(dim=-1)    # TR: Transverse Reinforcement Ratio，2 類
-        # class_idx = ar_idx * 6 + lr_idx * 2 + tr_idx  # AR(2) × LR(3) × TR(2) = 12 種組合
-        # class_idx = class_idx.long()
-
-        # label_onehot = F.one_hot(class_idx, num_classes=self.numclasses).float()
-        # label_embedding = self.condition_embedding(label_onehot)  # [N, W]
-        
-        # ========================================================
-        # [修正3] 判斷 hidden_state 是否已被投影
-        # 如果在 run_network 中已經用 condition_feature 投影過（256維），直接使用
-        # 如果還是原始的 1024 維，在此投影
-        # 這樣做的好處是 backward compatible，
-        # 不管是從 run_network 呼叫（已投影）或直接呼叫（未投影）都能正確運作
-        # ========================================================
-        if hidden_state.shape[-1] == self.W:
-            # 已經在 run_network 中投影過了 (256維)
-            feature_embedding = hidden_state
-        else:
-            # 原始 hidden_state (1024維)，需要投影
-            feature_embedding = self.condition_feature(hidden_state)
+        # 直接使用已投影的 hidden_state
+        feature_embedding = hidden_state
 
         input_o, input_shape = torch.split(input_pts, [63, 256], dim=-1)
-        conditioned_shape = input_shape #* label_embedding
-        conditioned_input = torch.cat([input_o, conditioned_shape, feature_embedding], dim=-1)
+        conditioned_input = torch.cat([input_o, input_shape, feature_embedding], dim=-1)
         h = conditioned_input
         for i, l in enumerate(self.pts_linears):
             h = self.pts_linears[i](h)
@@ -145,22 +119,15 @@ class NeRF(nn.Module):
 
         if self.use_viewdirs:
             alpha = self.alpha_linear(h)
-            # alpha = all_alphas.gather(1, class_idx.unsqueeze(1))
             feature = self.feature_linear(h)
             h = torch.cat([feature, input_views], -1)
-        
             for i, l in enumerate(self.views_linears):
                 h = self.views_linears[i](h)
                 h = relu(h)
-
             rgb = self.rgb_linear(h)
-            # all_rgbs = all_rgbs.view(-1, self.numclasses, 3)
-            # idx_expanded = class_idx.unsqueeze(1).unsqueeze(2).expand(-1, 1, 3)
-            # rgb = all_rgbs.gather(1, idx_expanded).squeeze(1)
             outputs = torch.cat([rgb, alpha], -1)
         else:
             outputs = self.output_linear(h)
-
         return outputs   
 
 

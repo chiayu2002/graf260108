@@ -51,7 +51,7 @@ class CCSRLoss(nn.Module):
         perceptual_loss = F.mse_loss(sr_feat, real_feat)
         
         # 3. 總和：知覺損失權重通常較大以降低 FID
-        return l1_loss + 0.01 * perceptual_loss
+        return l1_loss + 0.01 * perceptual_loss #l1_loss #
     
 
 def compute_loss(d_outs, target_value):

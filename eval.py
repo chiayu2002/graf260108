@@ -173,32 +173,44 @@ def generate_paired_samples(generator, evaluator, dataset, zdist, cached_hidden_
         
         # 生成假影像
         z = zdist.sample((1,))
-        
+
         with torch.no_grad():
             pose = generator.sample_select_pose(selected_u, selected_v)
             rays = generator.sample_select_rays(selected_u, selected_v)
-            rays = rays  # [2, N, 3]
-            
-            rgb_fake, _, _ = generator(z, label, hidden_state, rays=rays)
-        
-        # 將 NeRF patch 重塑為影像
-        patch_size = int(np.sqrt(rgb_fake.shape[1] // 3))
-        # rgb_fake: [1, N*3] → 先 denormalize
-        rgb_fake_img = (rgb_fake / 2 + 0.5).clamp(0, 1)
-        rgb_fake_img = rgb_fake_img.view(1, patch_size, patch_size, 3).permute(0, 3, 1, 2)  # [1, 3, H, W]
-        
+
+            # eval 模式下 generator 回傳 4 個值 (use_test_kwargs=True)
+            # rgb_fake shape: [N_rays, 3],範圍已經是 [-1, 1]
+            rgb_fake, _, _, _ = generator(z, label, hidden_state, rays=rays)
+
+        # ========================================================
+        # [修正] rgb_fake 是 [N_rays, 3],不是 [B, N*3]
+        # patch_size = sqrt(N_rays)
+        # ========================================================
+        n_rays = rgb_fake.shape[0]
+        patch_size = int(np.sqrt(n_rays))
+        assert patch_size * patch_size == n_rays, \
+            f"n_rays={n_rays} is not a perfect square"
+
+        # Denormalize [-1, 1] → [0, 1]
+        rgb_fake_01 = (rgb_fake / 2 + 0.5).clamp(0, 1)   # [N_rays, 3]
+
+        # [N_rays, 3] → [H, W, 3] → [3, H, W]
+        rgb_fake_img = rgb_fake_01.view(patch_size, patch_size, 3).permute(2, 0, 1)  # [3, H, W]
+
         # 真實影像 denormalize
         img_real_01 = (img_real / 2 + 0.5).clamp(0, 1)  # [3, H, W]
-        
-        # 如果尺寸不同，將真實影像 resize 到 patch 大小
+
+        # 如果尺寸不同,把真實影像 resize 到 generator 輸出的尺寸
         if img_real_01.shape[1] != patch_size:
             img_real_resized = torch.nn.functional.interpolate(
-                img_real_01.unsqueeze(0), size=(patch_size, patch_size), 
-                mode='bilinear', align_corners=False
+                img_real_01.unsqueeze(0),
+                size=(patch_size, patch_size),
+                mode='bilinear',
+                align_corners=False
             ).squeeze(0)
         else:
             img_real_resized = img_real_01
-        
+
         # 判斷實驗名稱
         filename = dataset.filenames[idx]
         exp_name = 'unknown'
@@ -206,10 +218,10 @@ def generate_paired_samples(generator, evaluator, dataset, zdist, cached_hidden_
             if e in filename:
                 exp_name = e
                 break
-        
+
         pairs.append({
-            'real': img_real_resized.cpu(),       # [3, H, W] range [0,1]
-            'fake': rgb_fake_img.squeeze(0).cpu(), # [3, H, W] range [0,1]
+            'real': img_real_resized.cpu(),   # [3, H, W] range [0,1]
+            'fake': rgb_fake_img.cpu(),       # [3, H, W] range [0,1]  ← 不用再 squeeze
             'label': label.cpu().squeeze(0),
             'exp_name': exp_name,
         })
@@ -224,13 +236,13 @@ def generate_paired_samples(generator, evaluator, dataset, zdist, cached_hidden_
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Evaluate GRAF model.')
-    parser.add_argument('--config', type=str, default='./results/column20260404_gru_hidden_state_disc_2/config.yaml', help='Path to config file.')
-    parser.add_argument('--checkpoint', type=str, default='./results/column20260404_gru_hidden_state_disc_2/chkpts/model_00069999.pt', help='Path to checkpoint file.')
+    parser.add_argument('--config', type=str, default='./results/column20260407_gru_hidden_state_disc_Dbn_lrg5_aux/config.yaml', help='Path to config file.')
+    parser.add_argument('--checkpoint', type=str, default='./results/column20260407_gru_hidden_state_disc_Dbn_lrg5_aux/chkpts/model_00039999.pt', help='Path to checkpoint file.')
     parser.add_argument('--fid_kid', action='store_true', help='Evaluate FID and KID.')
-    parser.add_argument('--psnr_r2', action='store_true', help='Evaluate PSNR and R².')
-    parser.add_argument('--create_sample', action='store_true', help='Generate sample images.')
+    parser.add_argument('--psnr_r2', default=False, action='store_true', help='Evaluate PSNR and R².')
+    parser.add_argument('--create_sample', default=True, action='store_true', help='Generate sample images.')
     parser.add_argument('--num_pairs', type=int, default=200, help='Number of pairs for PSNR/R² evaluation.')
-    parser.add_argument('--all', default=True , action='store_true', help='Run all evaluations.')
+    parser.add_argument('--all', default=False , action='store_true', help='Run all evaluations.')
     
     args = parser.parse_args()
     
@@ -300,29 +312,38 @@ if __name__ == '__main__':
     generator, _ = build_models(config, disc=False)
     print(f'Generator params: {count_trainable_parameters(generator)}')
     generator = generator.to(device)
-    
+
     img_to_patch = ImgToPatch(generator.ray_sampler, hwfr[:3])
-    
+
+    zdist = get_zdist(config['z_dist']['type'], config['z_dist']['dim'], device=device)
+
+    evaluator = Evaluator(args.fid_kid, generator, zdist, None,
+                        batch_size=batch_size, device=device)
+
+    # ========================================================
+    # [修正] CheckpointIO 只建一次,register 後立刻 load
+    # 之前的版本建了兩次,第二次把 register 清掉了 → 載入空權重 → 黑圖
+    # ========================================================
     checkpoint_io = CheckpointIO(checkpoint_dir=checkpoint_dir)
     checkpoint_io.register_modules(**generator.module_dict)
-    
-    zdist = get_zdist(config['z_dist']['type'], config['z_dist']['dim'], device=device)
-    
-    evaluator = Evaluator(args.fid_kid, generator, zdist, None,
-                          batch_size=batch_size, device=device)
-    
-    # 載入 checkpoint
-    print(f"Loading checkpoint: {args.checkpoint}")
-    checkpoint_dir = os.path.join(out_dir, 'chkpts') 
-    checkpoint_io = CheckpointIO(checkpoint_dir=checkpoint_dir)
-    target_checkpoint = "model_00069999.pt"
-    full_checkpoint_path = os.path.join(checkpoint_dir, target_checkpoint)
-    load_dict = checkpoint_io.load(target_checkpoint)
-    # load_dict = checkpoint_io.load(args.checkpoint)
+
+    # Sanity check: 確認 register 有 module
+    print(f"Registered modules in CheckpointIO: {list(checkpoint_io.module_dict.keys())}")
+    assert len(checkpoint_io.module_dict) > 0, "No modules registered, checkpoint will load nothing!"
+
+    # 載入 checkpoint — 用 args.checkpoint 而不是 hardcode
+    checkpoint_filename = os.path.basename(args.checkpoint)
+    print(f"Loading checkpoint: {checkpoint_filename}")
+    load_dict = checkpoint_io.load(checkpoint_filename)
     it = load_dict.get('it', -1)
     epoch_idx = load_dict.get('epoch_idx', -1)
     print(f"Loaded checkpoint at iteration {it}, epoch {epoch_idx}")
-    print(f"成功載入權重: {target_checkpoint}, Iteration: {it}")
+
+    # Sanity check: 確認權重真的進去了
+    nerf_model = generator.render_kwargs_train['network_fn']
+    first_layer_norm = nerf_model.condition_feature.weight.norm().item()
+    print(f"[Sanity] condition_feature weight norm = {first_layer_norm:.4f}")
+    print("  (如果是 ~10-30 → 載入成功;如果是 ~1-5 → 還是隨機初始化,有問題)")
     
     # ============================================================
     # 1. 生成視覺化樣本
@@ -381,7 +402,7 @@ if __name__ == '__main__':
         print("\n" + "="*60)
         print("Computing FID and KID...")
         print("="*60)
-        
+
         val_loader = DataLoader(
             val_dataset,
             batch_size=batch_size,
@@ -391,76 +412,123 @@ if __name__ == '__main__':
             drop_last=False,
             generator=torch.Generator(device='cuda:0')
         )
-        
-        # ========================================================
-        # [修正] FID/KID 計算流程
-        #
-        # 原本 eval.py 的問題：
-        # 1. 先生成 1000 張假圖存成 numpy
-        # 2. 再用 DataLoader 包起來
-        # 3. 呼叫 evaluator.compute_fid_kid(label, sample_loader)
-        #    → 但 compute_fid_kid 的簽名是 (real_label, hidden_state, sample_generator)
-        #    → sample_loader 被當成 hidden_state 傳入！
-        #
-        # 正確做法：
-        # 1. 用 evaluator.inception_eval.initialize_target() 計算真實圖的統計量
-        # 2. 用 evaluator.compute_fid_kid() 內建的 sample generator 生成假圖
-        #    → 它會自動呼叫 create_samples 並計算 Inception 特徵
-        #
-        # 但 compute_fid_kid 使用固定的 real_label 和 hidden_state
-        # 這代表所有假圖都使用同一組條件，FID 只衡量該條件下的品質
-        # 更好的做法：隨機抽取不同條件來計算
-        # ========================================================
-        
+
         # Step 1: 計算真實圖的 Inception 特徵統計量
         fid_cache_file = os.path.join(out_dir, 'fid_cache_train.npz')
         kid_cache_file = os.path.join(out_dir, 'kid_cache_train.npz')
         evaluator.inception_eval.initialize_target(
             val_loader, cache_file=fid_cache_file, act_cache_file=kid_cache_file
         )
-        
-        # Step 2: 用各實驗的條件計算 FID/KID，然後取平均
+
+        # ========================================================
+        # [主要指標] Marginal FID with matched conditioning
+        # 對每個 batch 隨機從 dataset 抽 real images，用它們的 hidden_state
+        # 來生 fake → fake 的條件分布自然匹配 real
+        # ========================================================
+        print("\n  [Marginal FID with matched conditioning]")
+
+        def matched_sample_generator():
+            """每次 yield 一個 batch 的 fake，條件從 dataset 隨機抽"""
+            n_dataset = len(train_dataset)
+            while True:
+                # 隨機抽 batch_size 個 real samples 拿條件
+                indices = np.random.choice(n_dataset, size=batch_size, replace=False)
+                labels_batch = []
+                hs_batch = []
+                for idx in indices:
+                    _, label_i, hs_i = train_dataset[idx]
+                    labels_batch.append(label_i)
+                    hs_batch.append(hs_i)
+                label_batch = torch.stack(labels_batch).to(device)       # [B, 9]
+                hs_batch = torch.stack(hs_batch).to(device)              # [B, 1024]
+
+                z = zdist.sample((batch_size,))
+                with torch.no_grad():
+                    rgb, _, _ = evaluator.create_samples(z, label_batch, hs_batch)
+
+                # uint8 quantization (跟 train.py 裡 sample 一致)
+                rgb = (rgb / 2 + 0.5).mul_(255).clamp_(0, 255).to(torch.uint8).to(torch.float) / 255. * 2 - 1
+                yield rgb.cpu()
+
+        fid_marginal, kid_marginal = evaluator.compute_fid_kid(
+            real_label=None,  # 不會被用到
+            hidden_state=None,  # 不會被用到
+            sample_generator=matched_sample_generator()
+        )
+        print(f"    Marginal FID = {fid_marginal:.2f}")
+        print(f"    Marginal KID×100 = {kid_marginal*100:.2f}")
+        torch.cuda.empty_cache()
+
+        # ========================================================
+        # [Diagnostic] Per-specimen FID — 看每個材料條件單獨表現
+        # 注意：每個 spec 的樣本數少，數字會有 small-sample bias，
+        # 只當作相對比較用，不要當絕對指標
+        # ========================================================
+        print("\n  [Per-specimen FID (diagnostic only — biased high due to small n)]")
         fid_results = {}
         kid_results = {}
-        
+
+        # 解析 v_list
+        v_list_eval = [float(x.strip()) for x in config['data']['v'].split(",")]
+        n_heights_eval = len(v_list_eval)
+
         for spec_name, hs in cached_hidden_states.items():
-            # 找到該實驗對應的 label
             spec_key = spec_name + '_n'
-            if spec_key in train_dataset.specimen_props:
-                props = train_dataset.specimen_props[spec_key]
-                label_vec = props['AR'] + props['LR'] + props['TR']
-            else:
-                print(f"  Warning: {spec_key} not in specimen_props, skipping")
+            if spec_key not in train_dataset.specimen_props:
                 continue
-            
-            label_tensor = torch.tensor([label_vec], dtype=torch.float32).to(device)
-            hs_tensor = hs.unsqueeze(0).to(device)  # [1, 1024]
-            
-            print(f"  Computing FID/KID for {spec_name}...")
-            fid, kid = evaluator.compute_fid_kid(label_tensor, hs_tensor)
+
+            props = train_dataset.specimen_props[spec_key]
+            label_vec_7d = props['AR'] + props['LR'] + props['TR']
+
+            # ========================================================
+            # 補成 9 維 — 因為 per-spec FID 是要評估這個 spec 在
+            # 「各種視角」下的整體品質,所以每次 sample 隨機抽 view
+            # ========================================================
+            def per_spec_sample_gen(label_7d, hs_single):
+                while True:
+                    full_labels = []
+                    for _ in range(batch_size):
+                        h_idx = float(np.random.randint(0, n_heights_eval))
+                        a_idx = float(np.random.randint(0, 360))
+                        full_label = label_7d + [h_idx, a_idx]
+                        full_labels.append(torch.tensor(full_label, dtype=torch.float32))
+                    label_batch = torch.stack(full_labels).to(device)
+                    hs_batch = hs_single.unsqueeze(0).expand(batch_size, -1).to(device)
+
+                    z = zdist.sample((batch_size,))
+                    with torch.no_grad():
+                        rgb, _, _ = evaluator.create_samples(z, label_batch, hs_batch)
+                    rgb = (rgb / 2 + 0.5).mul_(255).clamp_(0, 255).to(torch.uint8).to(torch.float) / 255. * 2 - 1
+                    yield rgb.cpu()
+
+            print(f"    Computing for {spec_name}...")
+            fid, kid = evaluator.compute_fid_kid(
+                None, None,
+                sample_generator=per_spec_sample_gen(label_vec_7d, hs)
+            )
             fid_results[spec_name] = fid
             kid_results[spec_name] = kid
-            print(f"    FID={fid:.2f}, KID×100={kid*100:.2f}")
+            print(f"      FID={fid:.2f}, KID×100={kid*100:.2f}")
             torch.cuda.empty_cache()
-        
-        # 計算平均
-        avg_fid = np.mean(list(fid_results.values()))
-        avg_kid = np.mean(list(kid_results.values()))
-        
-        print(f"\n  Average FID: {avg_fid:.2f}")
-        print(f"  Average KID×100: {avg_kid*100:.2f}")
-        
+
         # 儲存結果
         filename = f'fid_kid_iter{it}.csv'
         outpath = os.path.join(eval_dir, filename)
         with open(outpath, mode='w', newline='') as csv_file:
             writer = csv.writer(csv_file)
-            writer.writerow(['experiment', 'fid', 'kid', 'kid_x100'])
+            writer.writerow(['metric', 'fid', 'kid', 'kid_x100'])
+            writer.writerow(['MARGINAL (primary)',
+                            f"{fid_marginal:.4f}",
+                            f"{kid_marginal:.6f}",
+                            f"{kid_marginal*100:.4f}"])
+            writer.writerow([])
+            writer.writerow(['per-spec (diagnostic)', 'fid', 'kid', 'kid_x100'])
             for spec_name in fid_results:
-                writer.writerow([spec_name, f"{fid_results[spec_name]:.4f}", 
-                               f"{kid_results[spec_name]:.6f}", f"{kid_results[spec_name]*100:.4f}"])
-            writer.writerow(['AVERAGE', f"{avg_fid:.4f}", f"{avg_kid:.6f}", f"{avg_kid*100:.4f}"])
-        print(f"  Saved to {outpath}")
+                writer.writerow([spec_name,
+                                f"{fid_results[spec_name]:.4f}",
+                                f"{kid_results[spec_name]:.6f}",
+                                f"{kid_results[spec_name]*100:.4f}"])
+        print(f"\n  Saved to {outpath}")
     
     # ============================================================
     # 3. PSNR / R² / SSIM 計算

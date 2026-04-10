@@ -70,54 +70,51 @@ class Generator(object):
             else:
                 all_rays = []
                 for i in range(label.size(0)):
-                    second_value = label[i, 7].item()
-                    index = int(label[i, 8].item())
-
-                    selected_u = index / 360
-                    selected_v = self._v_list[int(second_value)]  # 使用預解析的 v_list
-
+                    # 唯一還在用 label 的地方:抽 view 參數
+                    height_idx = int(label[i, 7].item())
+                    angle_idx = int(label[i, 8].item())
+                    selected_u = angle_idx / 360
+                    selected_v = self._v_list[height_idx]
                     rays_i = self.sample_select_rays(selected_u, selected_v)
                     all_rays.append(rays_i)
-                    
                 rays = torch.cat(all_rays, dim=1)
 
         render_kwargs = self.render_kwargs_test if self.use_test_kwargs else self.render_kwargs_train
         render_kwargs = dict(render_kwargs)
-
         render_kwargs['features'] = z
-        label_input = label[:, :7]
-        rgb, disp, acc, extras = render(self.H, self.W, self.focal, label_input, hidden_state, chunk=self.chunk, rays=rays,
-                                        **render_kwargs)
+
+        # ========================================================
+        # [清理] 不再把 label 傳給 render
+        # render 路徑只需要 hidden_state，因為 NeRF 內部不用 AR/LR/TR
+        # ========================================================
+        rgb, disp, acc, extras = render(
+            self.H, self.W, self.focal,
+            hidden_state,
+            chunk=self.chunk, rays=rays,
+            **render_kwargs
+        )
 
         rays_to_output = lambda x: x.view(len(x), -1) * 2 - 1
-
         rgb_nerf = rays_to_output(rgb)
         disp_out = rays_to_output(disp)
         acc_out = rays_to_output(acc)
 
         ccsr_output = None
         if self.use_ccsr and return_ccsr_output:
+            # CCSR 的 view_idx 還是要用 label[:, 8]（angle_idx）
             patch_size = int(np.sqrt(rgb.shape[0] // bs))
             nerf_patch = rgb.view(bs, patch_size, patch_size, 3).permute(0, 3, 1, 2).contiguous()
-            
-            # ========================================================
-            # [效能優化] 向量化 CCSR 處理
-            # 原本：逐樣本 for loop，batch_size=1 處理
-            # 現在：按 view_idx 分組，每組批次處理
-            # 同一個 view_idx 的樣本一起通過 CCSR 網路
-            # ========================================================
+
             angle_indices = label[:, 8].int()
             view_indices = (angle_indices * self.ccsr.num_views) // 360
-            
+
             unique_views = torch.unique(view_indices)
             ccsr_results = torch.zeros_like(nerf_patch)
-            
             for vidx in unique_views:
                 mask = (view_indices == vidx)
                 batch_input = nerf_patch[mask]
                 batch_output = self.ccsr(batch_input, vidx.item())
                 ccsr_results[mask] = batch_output
-            
             ccsr_output = ccsr_results
 
         if self.use_test_kwargs:

@@ -79,14 +79,14 @@ def build_models(config, disc=True):
                                      min_scale=config['ray_sampler']['min_scale'],
                                      max_scale=config['ray_sampler']['max_scale'],
                                      scale_anneal=config['ray_sampler']['scale_anneal'],
-                                     orthographic=config['data']['orthographic'],
-                                     )
+                                     orthographic=config['data']['orthographic'])
 
     H, W, f, r = config['data']['hwfr']
 
     generator = Generator(H, W, f, r,
                           ray_sampler=ray_sampler,
-                          render_kwargs_train=render_kwargs_train, render_kwargs_test=render_kwargs_test,
+                          render_kwargs_train=render_kwargs_train,
+                          render_kwargs_test=render_kwargs_test,
                           parameters=params, named_parameters=named_parameters,
                           chunk=config_nerf.chunk,
                           range_u=(float(config['data']['umin']), float(config['data']['umax'])),
@@ -95,24 +95,30 @@ def build_models(config, disc=True):
                           v=config['data']['v'],
                           use_default_rays=config['data']['use_default_rays'],
                           use_ccsr=config['ccsr']['enabled'],
-                          num_views=8
-                          )
-    
+                          num_views=8)
+
     discriminator = None
     if disc:
         # ========================================================
-        # [修正] 改用 hidden_state 條件的 Discriminator
-        # 原本：用 label [B, 7] 做 spatial conditioning + 分類
-        # 現在：用 hidden_state [B, 1024] 投影後做 spatial conditioning
-        # 不再需要 num_classes 參數
+        # [共享] 從 NeRF 抓出 condition_feature，讓 D 用同一個 instance
+        # NeRF 的 condition_feature 是 nn.Linear(1024, netwidth=256)
         # ========================================================
+        nerf_model = render_kwargs_train['network_fn']
+        shared_cond_proj = nerf_model.condition_feature
+
+        # cond_dim 必須等於 NeRF 的 netwidth（因為共享同一個 Linear）
+        assert config['discriminator'].get('cond_dim', 256) == config['nerf']['netwidth'], \
+            f"discriminator.cond_dim must equal nerf.netwidth (got " \
+            f"{config['discriminator'].get('cond_dim', 256)} vs {config['nerf']['netwidth']})"
+
         disc_kwargs = {
             'nc': 3,
             'ndf': config['discriminator']['ndf'],
             'imsize': 64,
             'hflip': config['discriminator']['hflip'],
             'hidden_dim': config['discriminator'].get('hidden_dim', 1024),
-            'cond_dim': config['discriminator'].get('cond_dim', 16),
+            'cond_dim': config['discriminator'].get('cond_dim', 256),  # 改預設值對齊 yaml
+            'shared_cond_proj': shared_cond_proj,
         }
         discriminator = Discriminator(**disc_kwargs)
 

@@ -88,6 +88,13 @@ def main():
     save_best = config['training']['save_best']
     reg_param = config['training']['reg_param']
     device = torch.device("cuda:0")
+
+    # ========================================================
+    # [CCSR Toggle] 一個 flag 控制全部 CCSR 相關邏輯
+    # ========================================================
+    use_ccsr = config['ccsr']['enabled']
+    lambda_ccsr = config['ccsr'].get('alpha_init', 1.0) if use_ccsr else 0.0
+    print(f"[CCSR] enabled = {use_ccsr}, lambda = {lambda_ccsr}")
     
     out_dir, checkpoint_dir = setup_directories(config)
     save_config(os.path.join(out_dir, 'config.yaml'), config)
@@ -145,6 +152,18 @@ def main():
         cached_hidden_states[exp_name] = hs.to(device)
     print(f"Cached hidden states for: {list(cached_hidden_states.keys())}")
 
+    print("\n[Sanity Check] Hidden state differences:")
+    hs_keys = list(cached_hidden_states.keys())
+    for i, k1 in enumerate(hs_keys):
+        for k2 in hs_keys[i+1:]:
+            diff = (cached_hidden_states[k1] - cached_hidden_states[k2]).norm().item()
+            cos_sim = torch.nn.functional.cosine_similarity(
+                cached_hidden_states[k1].unsqueeze(0),
+                cached_hidden_states[k2].unsqueeze(0)
+            ).item()
+            print(f"  {k1} vs {k2}:  L2={diff:.4f}, cos_sim={cos_sim:.4f}")
+    print()
+
     fid_best = float('inf')
     kid_best = float('inf')
     
@@ -165,6 +184,14 @@ def main():
     # 條件資訊完全透過 hidden_state 注入
     # ========================================================
 
+    # ========================================================
+    # [CCSR Helper] 把 image-format tensor [B,3,H,W] 轉成 D 接受的
+    # flat-patch format [B*H*W, 3]
+    # ========================================================
+    def ccsr_to_flat(x):
+        """[B, 3, H, W] -> [B*H*W, 3] 對齊 NeRF rays_to_output 的格式"""
+        return x.permute(0, 2, 3, 1).reshape(-1, 3)
+
     while True:
         epoch_idx += 1
         for x_real, label, hidden_state in tqdm(train_loader, desc=f"Epoch {epoch_idx}"):
@@ -180,40 +207,43 @@ def main():
             generator.train()
             discriminator.train()
 
-            # ========== Discriminator Step ==========
+            # ==================== Discriminator Step ====================
             d_optimizer.zero_grad()
 
             rgbs = img_to_patch(x_real)
             rgbs.requires_grad_(True)
 
             z = zdist.sample((batch_size,))
-            
-            # ========================================================
-            # [變更] discriminator 改為接收 hidden_state 而非 label
-            # 原本: d_real, label_pred = discriminator(rgbs, label)
-            # 現在: d_real = discriminator(rgbs, hidden_state)
-            # 回傳值只有真假判別分數，不再有分類預測
-            # ========================================================
-            
+
             # Real
-            d_real = discriminator(rgbs, hidden_state)
+            # d_real = discriminator(rgbs, hidden_state)
+            d_real, aux_real = discriminator(rgbs, hidden_state, return_aux=True)
             dloss_real = compute_loss(d_real, 1)
+            aux_loss_real = F.mse_loss(aux_real, hidden_state)  # 預測 ground truth condition
             reg = reg_param * compute_grad2(d_real, rgbs).mean()
-            
+
             # Fake
             with torch.no_grad():
-                x_fake, _ = generator(z, label, hidden_state)
-            x_fake.requires_grad_()
-            
-            d_fake = discriminator(x_fake, hidden_state)
-            dloss_fake = compute_loss(d_fake, 0)
+                if use_ccsr:
+                    rgb_nerf, _, ccsr_out = generator(
+                        z, label, hidden_state, return_ccsr_output=True
+                    )
+                    x_fake_for_d = ccsr_to_flat(ccsr_out)
+                else:
+                    rgb_nerf, _ = generator(z, label, hidden_state)
+                    x_fake_for_d = rgb_nerf
 
-            total_d_loss = dloss_real + dloss_fake + reg
+            # d_fake = discriminator(x_fake_for_d, hidden_state)
+            d_fake, aux_fake = discriminator(rgb_nerf, hidden_state, return_aux=True)
+            dloss_fake = compute_loss(d_fake, 0)
+            aux_loss_fake = F.mse_loss(aux_fake, hidden_state)
+
+            total_d_loss = dloss_real + dloss_fake + reg + aux_loss_real + aux_loss_fake
             total_d_loss.backward()
             d_optimizer.step()
             d_scheduler.step()
 
-            # ========== Generator Step ==========
+            # ==================== Generator Step ====================
             if config['nerf']['decrease_noise']:
                 generator.decrease_nerf_noise(it)
 
@@ -224,10 +254,26 @@ def main():
             g_optimizer.zero_grad()
 
             z = zdist.sample((batch_size,))
-            x_fake, _ = generator(z, label, hidden_state)
-            
-            d_fake = discriminator(x_fake, hidden_state)
-            gloss = compute_loss(d_fake, 1)
+
+            if use_ccsr:
+                rgb_nerf, _, ccsr_out = generator(
+                    z, label, hidden_state, return_ccsr_output=True
+                )
+                ccsr_flat = ccsr_to_flat(ccsr_out)
+                # D 看精修後的版本
+                d_fake = discriminator(ccsr_flat, hidden_state)
+                gloss_adv = compute_loss(d_fake, 1)
+                # Consistency: CCSR 不能跟 NeRF 差太多
+                consistency_loss = F.l1_loss(ccsr_flat, rgb_nerf)
+                gloss = gloss_adv + lambda_ccsr * consistency_loss
+            else:
+                rgb_nerf, _ = generator(z, label, hidden_state)
+                # d_fake = discriminator(rgb_nerf, hidden_state)
+                d_fake, aux_fake = discriminator(rgb_nerf, hidden_state, return_aux=True)
+                gloss_adv = compute_loss(d_fake, 1)
+                gloss_aux = F.mse_loss(aux_fake, hidden_state)
+                consistency_loss = torch.tensor(0.0, device=device)  # 佔位
+                gloss = gloss_adv + gloss_aux
 
             gloss.backward()
             g_optimizer.step()
@@ -235,18 +281,25 @@ def main():
 
             current_lr_g = g_optimizer.param_groups[0]['lr']
             current_lr_d = d_optimizer.param_groups[0]['lr']
-            
+
             if (it + 1) % config['training']['print_every'] == 0:
-                wandb.log({
-                    "loss/generator": gloss,
+                log_dict = {
+                    "loss/generator_total": gloss,
+                    "loss/generator_adv": gloss_adv,
+                    "loss/generator_label": gloss_aux,
                     "loss/discriminator": total_d_loss,
+                    "loss/discriminator_reallabel": aux_loss_real,
+                    "loss/discriminator_fakelabel": aux_loss_fake,
                     "loss/dloss_real": dloss_real,
                     "loss/dloss_fake": dloss_fake,
                     "loss/regularizer": reg,
                     "learning rate/generator": current_lr_g,
                     "learning rate/discriminator": current_lr_d,
-                    "iteration": it
-                })
+                    "iteration": it,
+                }
+                if use_ccsr:
+                    log_dict["loss/ccsr_consistency"] = consistency_loss
+                wandb.log(log_dict)
 
             # Sample
             if ((it % config['training']['sample_every']) == 0) or ((it < 500) and (it % 100 == 0)):
@@ -278,22 +331,62 @@ def main():
                 grid_acc = vutils.make_grid(acc.detach().cpu(), nrow=8, normalize=True)
                 
                 wandb.log({
-                    "sample/rgb": [wandb.Image(grid_rgb, caption=f"RGB at iter {it}")],
-                    "sample/depth": [wandb.Image(grid_depth, caption=f"Depth at iter {it}")],
-                    "sample/acc": [wandb.Image(grid_acc, caption=f"Acc at iter {it}")],
+                    "sample/rgb": wandb.Image(grid_rgb, caption=f"iter {it}"),
+                    "sample/depth": wandb.Image(grid_depth, caption=f"Depth at iter {it}"),
+                    "sample/acc": wandb.Image(grid_acc, caption=f"Acc at iter {it}"),
                     "epoch_idx": epoch_idx,
                     "iteration": it
                 })
 
             # FID/KID
             if fid_every > 0 and ((it + 1) % fid_every) == 0:
-                fid, kid = evaluator.compute_fid_kid(label, hidden_state)
-                wandb.log({
-                    "validation/fid": fid,
-                    "validation/kid": kid,
-                    "iteration": it
-                })
+
+                # 收集所有可用的 (label_7d, hidden_state) pairs
+                all_conditions = []
+                for spec_name, hs in cached_hidden_states.items():
+                    spec_key = spec_name + '_n'
+                    if spec_key in train_dataset.specimen_props:
+                        props = train_dataset.specimen_props[spec_key]
+                        label_vec_7d = props['AR'] + props['LR'] + props['TR']
+                        all_conditions.append((
+                            torch.tensor(label_vec_7d, dtype=torch.float32),
+                            hs
+                        ))
+
+                # 解析 v_list,知道有幾個 height 可選
+                v_list = [float(x.strip()) for x in config['data']['v'].split(",")]
+                n_heights = len(v_list)
+
+                def matched_sample_gen():
+                    while True:
+                        # 隨機抽 condition
+                        cond_idxs = np.random.randint(0, len(all_conditions), size=batch_size)
+                        label_7d_list = [all_conditions[i][0] for i in cond_idxs]
+                        hs_list = [all_conditions[i][1] for i in cond_idxs]
+
+                        # 為每個 sample 隨機抽 view (height_idx, angle_idx)
+                        # 補成 9 維 label: [AR(2), LR(3), TR(2), height_idx, angle_idx]
+                        full_labels = []
+                        for label_7d in label_7d_list:
+                            height_idx = float(np.random.randint(0, n_heights))
+                            angle_idx = float(np.random.randint(0, 360))
+                            view_part = torch.tensor([height_idx, angle_idx], dtype=torch.float32)
+                            full_label = torch.cat([label_7d, view_part], dim=0)
+                            full_labels.append(full_label)
+
+                        label_batch = torch.stack(full_labels).to(device)   # [B, 9]
+                        hs_batch = torch.stack(hs_list).to(device)          # [B, 1024]
+
+                        z = zdist.sample((batch_size,))
+                        with torch.no_grad():
+                            rgb, _, _ = evaluator.create_samples(z, label_batch, hs_batch)
+                        rgb = (rgb / 2 + 0.5).mul_(255).clamp_(0, 255).to(torch.uint8).to(torch.float) / 255. * 2 - 1
+                        yield rgb.cpu()
+
+                fid, kid = evaluator.compute_fid_kid(None, None, sample_generator=matched_sample_gen())
+                wandb.log({"validation/fid": fid, "validation/kid": kid, "iteration": it})
                 torch.cuda.empty_cache()
+
                 if save_best == 'fid' and fid < fid_best:
                     fid_best = fid
                     print('Saving best model based on FID...')
