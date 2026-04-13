@@ -14,6 +14,7 @@ import pprint
 import sys
 sys.path.append('submodules')
 import torchvision.utils as vutils
+from contextlib import contextmanager
 
 from graf.gan_training import Evaluator
 from graf.config import get_data, build_models, load_config, save_config, build_lr_scheduler
@@ -88,6 +89,22 @@ def main():
     save_best = config['training']['save_best']
     reg_param = config['training']['reg_param']
     device = torch.device("cuda:0")
+    aux_loss_weight = 0.02
+
+    use_amp = config['training'].get('use_amp', False)
+    amp_dtype_str = config['training'].get('amp_dtype', 'bfloat16')
+    amp_dtype = torch.bfloat16 if amp_dtype_str == 'bfloat16' else torch.float16
+
+    print(f"[Training] AMP = {use_amp}, dtype = {amp_dtype_str}")
+
+    # GradScaler 只在 fp16 下需要,bf16 不需要(bf16 動態範圍夠)
+    if use_amp and amp_dtype == torch.float16:
+        scaler = torch.cuda.amp.GradScaler()
+        use_scaler = True
+    else:
+        scaler = None
+        use_scaler = False
+
 
     # ========================================================
     # [CCSR Toggle] 一個 flag 控制全部 CCSR 相關邏輯
@@ -192,6 +209,14 @@ def main():
         """[B, 3, H, W] -> [B*H*W, 3] 對齊 NeRF rays_to_output 的格式"""
         return x.permute(0, 2, 3, 1).reshape(-1, 3)
 
+    @contextmanager
+    def amp_context():
+        if use_amp:
+            with torch.cuda.amp.autocast(dtype=amp_dtype):
+                yield
+        else:
+            yield
+
     while True:
         epoch_idx += 1
         for x_real, label, hidden_state in tqdm(train_loader, desc=f"Epoch {epoch_idx}"):
@@ -215,15 +240,20 @@ def main():
 
             z = zdist.sample((batch_size,))
 
-            # Real
-            # d_real = discriminator(rgbs, hidden_state)
-            d_real, aux_real = discriminator(rgbs, hidden_state, return_aux=True)
-            dloss_real = compute_loss(d_real, 1)
-            aux_loss_real = F.mse_loss(aux_real, hidden_state)  # 預測 ground truth condition
-            reg = reg_param * compute_grad2(d_real, rgbs).mean()
+            # Real — 在 autocast 裡算 d_real 跟 aux loss
+            with amp_context():
+                d_real, aux_real = discriminator(rgbs, hidden_state, return_aux=True)
+                dloss_real = compute_loss(d_real, 1)
+                aux_loss_real = F.mse_loss(aux_real, hidden_state)  # 預測 ground truth condition
+
+            # ========================================================
+            # [重要] R1 gradient penalty 強制 fp32 — 二階梯度在 fp16/bf16 下
+            # 可能 NaN 或數值不穩,即使 bf16 也保守起見走 fp32
+            # ========================================================
+            reg = reg_param * compute_grad2(d_real.float(), rgbs).mean()
 
             # Fake
-            with torch.no_grad():
+            with torch.no_grad(), amp_context():
                 if use_ccsr:
                     rgb_nerf, _, ccsr_out = generator(
                         z, label, hidden_state, return_ccsr_output=True
@@ -233,14 +263,20 @@ def main():
                     rgb_nerf, _ = generator(z, label, hidden_state)
                     x_fake_for_d = rgb_nerf
 
-            # d_fake = discriminator(x_fake_for_d, hidden_state)
-            d_fake, aux_fake = discriminator(rgb_nerf, hidden_state, return_aux=True)
-            dloss_fake = compute_loss(d_fake, 0)
-            aux_loss_fake = F.mse_loss(aux_fake, hidden_state)
+            with amp_context():
+                d_fake = discriminator(rgb_nerf, hidden_state)   # 不要 return_aux
+                dloss_fake = compute_loss(d_fake, 0)
 
-            total_d_loss = dloss_real + dloss_fake + reg + aux_loss_real + aux_loss_fake
-            total_d_loss.backward()
-            d_optimizer.step()
+            total_d_loss = dloss_real + dloss_fake + reg + aux_loss_weight * (aux_loss_real)
+
+            if use_scaler:
+                scaler.scale(total_d_loss).backward()
+                scaler.step(d_optimizer)
+                scaler.update()
+            else:
+                total_d_loss.backward()
+                d_optimizer.step()
+
             d_scheduler.step()
 
             # ==================== Generator Step ====================
@@ -255,28 +291,35 @@ def main():
 
             z = zdist.sample((batch_size,))
 
-            if use_ccsr:
-                rgb_nerf, _, ccsr_out = generator(
-                    z, label, hidden_state, return_ccsr_output=True
-                )
-                ccsr_flat = ccsr_to_flat(ccsr_out)
-                # D 看精修後的版本
-                d_fake = discriminator(ccsr_flat, hidden_state)
-                gloss_adv = compute_loss(d_fake, 1)
-                # Consistency: CCSR 不能跟 NeRF 差太多
-                consistency_loss = F.l1_loss(ccsr_flat, rgb_nerf)
-                gloss = gloss_adv + lambda_ccsr * consistency_loss
-            else:
-                rgb_nerf, _ = generator(z, label, hidden_state)
-                # d_fake = discriminator(rgb_nerf, hidden_state)
-                d_fake, aux_fake = discriminator(rgb_nerf, hidden_state, return_aux=True)
-                gloss_adv = compute_loss(d_fake, 1)
-                gloss_aux = F.mse_loss(aux_fake, hidden_state)
-                consistency_loss = torch.tensor(0.0, device=device)  # 佔位
-                gloss = gloss_adv + gloss_aux
+            with amp_context():
+                if use_ccsr:
+                    rgb_nerf, _, ccsr_out = generator(
+                        z, label, hidden_state, return_ccsr_output=True
+                    )
+                    ccsr_flat = ccsr_to_flat(ccsr_out)
+                    # D 看精修後的版本
+                    d_fake = discriminator(ccsr_flat, hidden_state)
+                    gloss_adv = compute_loss(d_fake, 1)
+                    # Consistency: CCSR 不能跟 NeRF 差太多
+                    consistency_loss = F.l1_loss(ccsr_flat, rgb_nerf)
+                    gloss = gloss_adv + lambda_ccsr * consistency_loss
+                else:
+                    rgb_nerf, _ = generator(z, label, hidden_state)
+                    # d_fake = discriminator(rgb_nerf, hidden_state)
+                    d_fake, aux_fake = discriminator(rgb_nerf, hidden_state, return_aux=True)
+                    gloss_adv = compute_loss(d_fake, 1)
+                    gloss_aux = F.mse_loss(aux_fake, hidden_state)
+                    consistency_loss = torch.tensor(0.0, device=device)  # 佔位
+                    gloss = gloss_adv + aux_loss_weight * gloss_aux
 
-            gloss.backward()
-            g_optimizer.step()
+            if use_scaler:
+                scaler.scale(gloss).backward()
+                scaler.step(g_optimizer)
+                scaler.update()
+            else:
+                gloss.backward()
+                g_optimizer.step()
+
             g_scheduler.step()
 
             current_lr_g = g_optimizer.param_groups[0]['lr']
@@ -284,15 +327,15 @@ def main():
 
             if (it + 1) % config['training']['print_every'] == 0:
                 log_dict = {
-                    "loss/generator_total": gloss,
-                    "loss/generator_adv": gloss_adv,
-                    "loss/generator_label": gloss_aux,
-                    "loss/discriminator": total_d_loss,
-                    "loss/discriminator_reallabel": aux_loss_real,
-                    "loss/discriminator_fakelabel": aux_loss_fake,
-                    "loss/dloss_real": dloss_real,
-                    "loss/dloss_fake": dloss_fake,
-                    "loss/regularizer": reg,
+                    "loss/generator_total": gloss.item(),
+                    "loss/generator_adv": gloss_adv.item(),
+                    "loss/generator_label": gloss_aux.item(),
+                    "loss/discriminator": total_d_loss.item(),
+                    "loss/discriminator_reallabel": aux_loss_real.item(),
+                    # "loss/discriminator_fakelabel": aux_loss_fake.item(),
+                    "loss/dloss_real": dloss_real.item(),
+                    "loss/dloss_fake": dloss_fake.item(),
+                    "loss/regularizer": reg.item(),
                     "learning rate/generator": current_lr_g,
                     "learning rate/discriminator": current_lr_d,
                     "iteration": it,

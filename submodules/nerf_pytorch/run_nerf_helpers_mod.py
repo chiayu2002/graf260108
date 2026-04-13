@@ -41,7 +41,13 @@ class Embedder:
         self.out_dim = out_dim
         
     def embed(self, inputs):
-        return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
+        # ========================================================
+        # [AMP safe] 高頻 sin/cos 在 fp16 下會失精,強制 fp32
+        # 對 bfloat16 也適用 — 保守起見統一走 fp32
+        # ========================================================
+        with torch.cuda.amp.autocast(enabled=False):
+            inputs = inputs.float()
+            return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
 
 
 def get_embedder(multires, i=0):

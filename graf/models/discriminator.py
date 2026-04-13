@@ -52,12 +52,12 @@ class Discriminator(nn.Module):
         self.conv_out = nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False)
 
         self.aux_head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(ndf * 8, 256),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(256, hidden_dim),  # 1024
-        )
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Linear(ndf * 8, 32),                    # 512 → 32 bottleneck
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Linear(32, hidden_dim),                 # 32 → 1024
+            )
 
     def forward(self, input, hidden_state, return_aux=False):
         input = input[:, :self.nc]
