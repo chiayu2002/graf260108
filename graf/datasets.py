@@ -30,7 +30,7 @@ class ImageDataset(VisionDataset):
         self.extractor = extractor
         self.extractor_args = extractor_args
         self.result_dir = result_dir
-        self.exp_list = ['RS307','RS330','RS615'] #,'RS315'
+        self.exp_list = ['RS307', 'RS315', 'RS330','RS615'] #,'RS315'
         self.hysteresis = {}
         self.hidden_state = self.get_hidden_state(extractor, self.exp_list, result_dir=result_dir)
 
@@ -41,7 +41,7 @@ class ImageDataset(VisionDataset):
             "1.5_": 3,  
         }
 
-        target_specimens = ["RS307_n", "RS330_n", "RS615_n"] #, "RS615_n" , "RS315_n"
+        target_specimens = ["RS307_n", "RS315_n", "RS330_n",'RS615_n'] #, "RS615_n" , "RS315_n"
         self.specimen_props = {
             "RS307_n": {
                 "AR": [1, 0],       # 3.0
@@ -49,11 +49,11 @@ class ImageDataset(VisionDataset):
                 "TR": [0, 1]        # 1.282
             },
 
-            # "RS315_n": {
-            #     "AR": [1, 0],       # 6.0
-            #     "LR": [0, 1, 0],    # 1.444
-            #     "TR": [1, 0]        # 1.106
-            # },
+            "RS315_n": {
+                "AR": [1, 0],       # 6.0
+                "LR": [0, 1, 0],    # 1.444
+                "TR": [1, 0]        # 1.106
+            },
 
             "RS330_n": {
                 "AR": [1, 0],       # 3.0

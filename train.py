@@ -49,7 +49,7 @@ def initialize_training(config, device):
         hw_ortho = (config['data']['far']-config['data']['near'],) * 2
         hwfr[2] = hw_ortho
     config['data']['hwfr'] = hwfr
-    
+
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=config['training']['batch_size'],
@@ -72,8 +72,8 @@ def set_random_seed(seed):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
 
 def main():
     set_random_seed(0)
@@ -97,7 +97,6 @@ def main():
 
     print(f"[Training] AMP = {use_amp}, dtype = {amp_dtype_str}")
 
-    # GradScaler 只在 fp16 下需要,bf16 不需要(bf16 動態範圍夠)
     if use_amp and amp_dtype == torch.float16:
         scaler = torch.cuda.amp.GradScaler()
         use_scaler = True
@@ -105,10 +104,6 @@ def main():
         scaler = None
         use_scaler = False
 
-
-    # ========================================================
-    # [CCSR Toggle] 一個 flag 控制全部 CCSR 相關邏輯
-    # ========================================================
     use_ccsr = config['ccsr']['enabled']
     lambda_ccsr = config['ccsr'].get('alpha_init', 1.0) if use_ccsr else 0.0
     print(f"[CCSR] enabled = {use_ccsr}, lambda = {lambda_ccsr}")
@@ -190,23 +185,8 @@ def main():
     g_scheduler = build_lr_scheduler(g_optimizer, config, last_epoch=it)
     d_scheduler = build_lr_scheduler(d_optimizer, config, last_epoch=it)
 
-    # ========================================================
-    # [變更] 移除了:
-    # - MCE_Loss / criterion_cls（不再做分類）
-    # - n_each_task（不再需要）
-    # - lambda_cls_d / lambda_cls_g（不再需要）
-    # - CCSRLoss（如果你也不需要 CCSR 的話）
-    #
-    # Discriminator 現在只做真假判別，
-    # 條件資訊完全透過 hidden_state 注入
-    # ========================================================
-
-    # ========================================================
-    # [CCSR Helper] 把 image-format tensor [B,3,H,W] 轉成 D 接受的
-    # flat-patch format [B*H*W, 3]
-    # ========================================================
     def ccsr_to_flat(x):
-        """[B, 3, H, W] -> [B*H*W, 3] 對齊 NeRF rays_to_output 的格式"""
+        """[B, 3, H, W] -> [B*H*W, 3]"""
         return x.permute(0, 2, 3, 1).reshape(-1, 3)
 
     @contextmanager
@@ -216,6 +196,12 @@ def main():
                 yield
         else:
             yield
+
+    # ========================================================
+    # [預先解析] v_list — FID 跟 Sample 都要用
+    # ========================================================
+    v_list = [float(x.strip()) for x in config['data']['v'].split(",")]
+    n_heights = len(v_list)
 
     while True:
         epoch_idx += 1
@@ -240,19 +226,13 @@ def main():
 
             z = zdist.sample((batch_size,))
 
-            # Real — 在 autocast 裡算 d_real 跟 aux loss
             with amp_context():
                 d_real, aux_real = discriminator(rgbs, hidden_state, return_aux=True)
                 dloss_real = compute_loss(d_real, 1)
-                aux_loss_real = F.mse_loss(aux_real, hidden_state)  # 預測 ground truth condition
+                aux_loss_real = F.mse_loss(aux_real, hidden_state)
 
-            # ========================================================
-            # [重要] R1 gradient penalty 強制 fp32 — 二階梯度在 fp16/bf16 下
-            # 可能 NaN 或數值不穩,即使 bf16 也保守起見走 fp32
-            # ========================================================
             reg = reg_param * compute_grad2(d_real.float(), rgbs).mean()
 
-            # Fake
             with torch.no_grad(), amp_context():
                 if use_ccsr:
                     rgb_nerf, _, ccsr_out = generator(
@@ -264,7 +244,7 @@ def main():
                     x_fake_for_d = rgb_nerf
 
             with amp_context():
-                d_fake = discriminator(rgb_nerf, hidden_state)   # 不要 return_aux
+                d_fake = discriminator(rgb_nerf, hidden_state)
                 dloss_fake = compute_loss(d_fake, 0)
 
             total_d_loss = dloss_real + dloss_fake + reg + aux_loss_weight * (aux_loss_real)
@@ -297,19 +277,16 @@ def main():
                         z, label, hidden_state, return_ccsr_output=True
                     )
                     ccsr_flat = ccsr_to_flat(ccsr_out)
-                    # D 看精修後的版本
                     d_fake = discriminator(ccsr_flat, hidden_state)
                     gloss_adv = compute_loss(d_fake, 1)
-                    # Consistency: CCSR 不能跟 NeRF 差太多
                     consistency_loss = F.l1_loss(ccsr_flat, rgb_nerf)
                     gloss = gloss_adv + lambda_ccsr * consistency_loss
                 else:
                     rgb_nerf, _ = generator(z, label, hidden_state)
-                    # d_fake = discriminator(rgb_nerf, hidden_state)
                     d_fake, aux_fake = discriminator(rgb_nerf, hidden_state, return_aux=True)
                     gloss_adv = compute_loss(d_fake, 1)
                     gloss_aux = F.mse_loss(aux_fake, hidden_state)
-                    consistency_loss = torch.tensor(0.0, device=device)  # 佔位
+                    consistency_loss = torch.tensor(0.0, device=device)
                     gloss = gloss_adv + aux_loss_weight * gloss_aux
 
             if use_scaler:
@@ -332,7 +309,6 @@ def main():
                     "loss/generator_label": gloss_aux.item(),
                     "loss/discriminator": total_d_loss.item(),
                     "loss/discriminator_reallabel": aux_loss_real.item(),
-                    # "loss/discriminator_fakelabel": aux_loss_fake.item(),
                     "loss/dloss_real": dloss_real.item(),
                     "loss/dloss_fake": dloss_fake.item(),
                     "loss/regularizer": reg.item(),
@@ -344,47 +320,66 @@ def main():
                     log_dict["loss/ccsr_consistency"] = consistency_loss
                 wandb.log(log_dict)
 
-            # Sample
-            if ((it % config['training']['sample_every']) == 0) or ((it < 500) and (it % 100 == 0)):
-                plist = []
-                angle_positions = [(i/8, 0.5) for i in range(8)] 
-                ztest = zdist.sample((batch_size,))
-
-                vec_307 = [1.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0]
-
-                for i, (u, v) in enumerate(angle_positions):
-                    poses = generator.sample_select_pose(u, v)
-                    plist.append(poses)
+            # ==================== Sample (多 specimen 對比) ====================
+            if ((it % config['training']['sample_every']) == 0) or ((it < 5000) and (it % 200 == 0)):
+                angle_positions = [(i/8, 0.5) for i in range(8)]
+                plist = [generator.sample_select_pose(u, v) for (u, v) in angle_positions]
                 ptest = torch.stack(plist)
-
                 angles = [0, 45, 90, 135, 180, 225, 270, 315]
-                test_labels_list = []
-                for angle in angles:
-                    lbl = vec_307 + [0.5, float(angle)]
-                    test_labels_list.append(lbl)
-                label_test_all = torch.tensor(test_labels_list, dtype=torch.float32).to(device)
 
-                hs_307 = cached_hidden_states['RS307']
-                hs_test = hs_307.unsqueeze(0).expand(8, -1)
+                # 所有可用的 specimen
+                specimens_to_sample = {
+                    'RS307': [1.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0],
+                    'RS330': [1.0, 0.0,  0.0, 0.0, 1.0,  1.0, 0.0],
+                    'RS615': [0.0, 1.0,  0.0, 1.0, 0.0,  1.0, 0.0],
+                    'RS315': [1.0, 0.0,  0.0, 1.0, 0.0,  1.0, 0.0],
+                }
 
-                rgb, depth, acc = evaluator.create_samples(ztest.to(device), label_test_all, hs_test, ptest)
+                # 用同一組 z,這樣差異可以歸因於 conditioning
+                ztest = zdist.sample((8,))
+                rgb_panels = []
+                depth_panels = []
+                acc_panels = []
+                spec_names_shown = []
 
-                grid_rgb = vutils.make_grid(rgb.detach().cpu(), nrow=8, normalize=True)
-                grid_depth = vutils.make_grid(depth.detach().cpu(), nrow=8, normalize=True)
-                grid_acc = vutils.make_grid(acc.detach().cpu(), nrow=8, normalize=True)
-                
-                wandb.log({
-                    "sample/rgb": wandb.Image(grid_rgb, caption=f"iter {it}"),
-                    "sample/depth": wandb.Image(grid_depth, caption=f"Depth at iter {it}"),
-                    "sample/acc": wandb.Image(grid_acc, caption=f"Acc at iter {it}"),
-                    "epoch_idx": epoch_idx,
-                    "iteration": it
-                })
+                for spec_name, vec in specimens_to_sample.items():
+                    if spec_name not in cached_hidden_states:
+                        continue
 
-            # FID/KID
+                    test_labels_list = [vec + [0.5, float(a)] for a in angles]
+                    label_test_all = torch.tensor(test_labels_list, dtype=torch.float32).to(device)
+                    hs_spec = cached_hidden_states[spec_name]
+                    hs_test = hs_spec.unsqueeze(0).expand(8, -1)
+
+                    rgb, depth, acc = evaluator.create_samples(
+                        ztest.to(device), label_test_all, hs_test, ptest
+                    )
+                    rgb_panels.append(rgb.detach().cpu())
+                    depth_panels.append(depth.detach().cpu())
+                    acc_panels.append(acc.detach().cpu())
+                    spec_names_shown.append(spec_name)
+
+                if rgb_panels:
+                    rgb_all = torch.cat(rgb_panels, dim=0)
+                    depth_all = torch.cat(depth_panels, dim=0)
+                    acc_all = torch.cat(acc_panels, dim=0)
+
+                    grid_rgb = vutils.make_grid(rgb_all, nrow=8, normalize=True)
+                    grid_depth = vutils.make_grid(depth_all, nrow=8, normalize=True)
+                    grid_acc = vutils.make_grid(acc_all, nrow=8, normalize=True)
+
+                    caption = f"iter {it} | rows: {' / '.join(spec_names_shown)}"
+                    wandb.log({
+                        "sample/rgb": wandb.Image(grid_rgb, caption=caption),
+                        "sample/depth": wandb.Image(grid_depth, caption=caption),
+                        "sample/acc": wandb.Image(grid_acc, caption=caption),
+                        "epoch_idx": epoch_idx,
+                        "iteration": it,
+                    })
+
+            # ==================== FID/KID (with pose reconstruction) ====================
             if fid_every > 0 and ((it + 1) % fid_every) == 0:
 
-                # 收集所有可用的 (label_7d, hidden_state) pairs
                 all_conditions = []
                 for spec_name, hs in cached_hidden_states.items():
                     spec_key = spec_name + '_n'
@@ -396,19 +391,12 @@ def main():
                             hs
                         ))
 
-                # 解析 v_list,知道有幾個 height 可選
-                v_list = [float(x.strip()) for x in config['data']['v'].split(",")]
-                n_heights = len(v_list)
-
                 def matched_sample_gen():
                     while True:
-                        # 隨機抽 condition
                         cond_idxs = np.random.randint(0, len(all_conditions), size=batch_size)
                         label_7d_list = [all_conditions[i][0] for i in cond_idxs]
                         hs_list = [all_conditions[i][1] for i in cond_idxs]
 
-                        # 為每個 sample 隨機抽 view (height_idx, angle_idx)
-                        # 補成 9 維 label: [AR(2), LR(3), TR(2), height_idx, angle_idx]
                         full_labels = []
                         for label_7d in label_7d_list:
                             height_idx = float(np.random.randint(0, n_heights))
@@ -420,9 +408,21 @@ def main():
                         label_batch = torch.stack(full_labels).to(device)   # [B, 9]
                         hs_batch = torch.stack(hs_list).to(device)          # [B, 1024]
 
+                        # ============================================================
+                        # [修正] 從 label 重建 pose,跟 eval.py / CCSR eval 一致
+                        # 確保 train FID 跟 eval FID 可比較
+                        # ============================================================
+                        poses = torch.stack([
+                            generator.sample_select_pose(
+                                int(label_batch[i, 8].item()) / 360.0,
+                                v_list[int(label_batch[i, 7].item())]
+                            )
+                            for i in range(batch_size)
+                        ])
+
                         z = zdist.sample((batch_size,))
                         with torch.no_grad():
-                            rgb, _, _ = evaluator.create_samples(z, label_batch, hs_batch)
+                            rgb, _, _ = evaluator.create_samples(z, label_batch, hs_batch, poses)
                         rgb = (rgb / 2 + 0.5).mul_(255).clamp_(0, 255).to(torch.uint8).to(torch.float) / 255. * 2 - 1
                         yield rgb.cpu()
 
