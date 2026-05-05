@@ -19,11 +19,15 @@ from contextlib import contextmanager
 from graf.gan_training import Evaluator
 from graf.config import get_data, build_models, load_config, save_config, build_lr_scheduler
 from graf.utils import get_zdist
-from graf.train_step import compute_grad2, compute_loss, toggle_grad
+from graf.train_step import compute_grad2, compute_loss, toggle_grad, CCSRLoss
 from graf.transforms import ImgToPatch
 
 from GAN_stability.gan_training.checkpoints_mod import CheckpointIO
 
+
+# ========================================================
+# Helper functions
+# ========================================================
 
 def setup_directories(config):
     out_dir = os.path.join(config['training']['outdir'], config['expname'])
@@ -32,11 +36,16 @@ def setup_directories(config):
     os.makedirs(checkpoint_dir, exist_ok=True)
     return out_dir, checkpoint_dir
 
+
 def initialize_training(config, device):
     extractor_path = config['data']['extractor_path']
-    extractor_args = json.load(open(glob.glob("/Data/home/vicky/graf260108_im64/HystereticGRU/2026-03-24_17-13-01/args.json", recursive=True)[0], "r"))
+    extractor_args = json.load(open(glob.glob(
+        "/Data/home/vicky/graf260108_im64/HystereticGRU/2026-03-24_17-13-01/args.json",
+        recursive=True)[0], "r"))
     extractor_args = argparse.Namespace(**extractor_args)
-    extractor = importlib.import_module(f"graf.models.HystereticPrediction").__dict__[extractor_args.architecture](**vars(extractor_args))
+    extractor = importlib.import_module(
+        f"graf.models.HystereticPrediction"
+    ).__dict__[extractor_args.architecture](**vars(extractor_args))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     extractor = extractor.to(device)
     state_dict = torch.load(glob.glob(extractor_path, recursive=True)[0])["state_dict"]
@@ -46,7 +55,7 @@ def initialize_training(config, device):
     train_dataset, hwfr = get_data(config, extractor, extractor_args)
 
     if config['data']['orthographic']:
-        hw_ortho = (config['data']['far']-config['data']['near'],) * 2
+        hw_ortho = (config['data']['far'] - config['data']['near'],) * 2
         hwfr[2] = hw_ortho
     config['data']['hwfr'] = hwfr
 
@@ -54,10 +63,8 @@ def initialize_training(config, device):
         train_dataset,
         batch_size=config['training']['batch_size'],
         num_workers=config['training']['nworkers'],
-        shuffle=True, 
-        pin_memory=True,
-        sampler=None, 
-        drop_last=True,
+        shuffle=True, pin_memory=True,
+        sampler=None, drop_last=True,
         generator=torch.Generator(device='cuda:0')
     )
     
@@ -65,6 +72,7 @@ def initialize_training(config, device):
     generator = generator.to(device)
     discriminator = discriminator.to(device)
     return train_loader, train_dataset, generator, discriminator
+
 
 def set_random_seed(seed):
     torch.manual_seed(seed)
@@ -75,10 +83,50 @@ def set_random_seed(seed):
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
 
+
+def extract_real_patches(x_real, all_hw, target_size, device):
+    """
+    用 FlexGridRaySampler 的 hw 座標從 x_real 提取空間對齊的 patch。
+    
+    Args:
+        x_real:      [B, 3, 256, 256], range [-1, 1]
+        all_hw:      list of [patch_h, patch_w, 2] — grid_sample 座標
+        target_size: (H, W), e.g. (64, 64)
+        device:      torch device
+    Returns:
+        [B, 3, H, W], range [-1, 1], 與 NeRF 渲染空間完全對齊
+    """
+    real_patches = []
+    for i in range(len(all_hw)):
+        hw_i = all_hw[i]  # [patch_h, patch_w, 2]
+        # 轉成 [1, 2, ph, pw] → interpolate 到目標尺寸 → [1, tH, tW, 2]
+        grid = hw_i.permute(2, 0, 1).unsqueeze(0).to(device)
+        grid = F.interpolate(grid, size=target_size, mode='bilinear', align_corners=True)
+        grid = grid.squeeze(0).permute(1, 2, 0).unsqueeze(0)
+        patch_i = F.grid_sample(
+            x_real[i:i+1], grid, mode='bilinear', align_corners=True
+        )
+        real_patches.append(patch_i)
+    return torch.cat(real_patches, dim=0)
+
+
+# ========================================================
+# Main
+# ========================================================
+
 def main():
     set_random_seed(0)
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='configs/default.yaml')
+    # ============ 新增：checkpoint resume 參數 ============
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint file to resume training. '
+                             'Can be absolute path or filename in checkpoint_dir. '
+                             'E.g.: --resume model_best.pt  or  --resume /path/to/model_00010000.pt')
+    parser.add_argument('--resume_wandb_id', type=str, default=None,
+                        help='wandb run id to resume logging into the same run. '
+                             'E.g.: --resume_wandb_id abc123xy')
+    # =====================================================
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -89,12 +137,11 @@ def main():
     save_best = config['training']['save_best']
     reg_param = config['training']['reg_param']
     device = torch.device("cuda:0")
-    aux_loss_weight = 0.02
+    aux_loss_weight = config['training']['label_param']
 
     use_amp = config['training'].get('use_amp', False)
     amp_dtype_str = config['training'].get('amp_dtype', 'bfloat16')
     amp_dtype = torch.bfloat16 if amp_dtype_str == 'bfloat16' else torch.float16
-
     print(f"[Training] AMP = {use_amp}, dtype = {amp_dtype_str}")
 
     if use_amp and amp_dtype == torch.float16:
@@ -104,18 +151,31 @@ def main():
         scaler = None
         use_scaler = False
 
-    use_ccsr = config['ccsr']['enabled']
-    lambda_ccsr = config['ccsr'].get('alpha_init', 1.0) if use_ccsr else 0.0
-    print(f"[CCSR] enabled = {use_ccsr}, lambda = {lambda_ccsr}")
-    
+    # ========================================================
+    # Reconstruction Loss 設定
+    # ========================================================
+    recon_config = config.get('reconstruction', {})
+    use_recon = recon_config.get('enabled', False)
+    lambda_recon = recon_config.get('lambda_recon', 0.1)
+    print(f"[Recon] enabled={use_recon}, lambda_recon={lambda_recon}")
+    if use_recon:
+        print(f"[Recon] G_loss = GAN_adv + {lambda_recon} × Recon(NeRF, real) + aux")
+
     out_dir, checkpoint_dir = setup_directories(config)
     save_config(os.path.join(out_dir, 'config.yaml'), config)
     
-    wandb.init(
+    # ============ 修改：wandb init 支援 resume ============
+    wandb_kwargs = dict(
         project=config['wandb']['project'],
         name=config['wandb']['name'],
-        config=config
+        config=config,
     )
+    if args.resume_wandb_id is not None:
+        wandb_kwargs['id'] = args.resume_wandb_id
+        wandb_kwargs['resume'] = 'must'
+        print(f"[wandb] Resuming run id={args.resume_wandb_id}")
+    wandb.init(**wandb_kwargs)
+    # =====================================================
 
     train_loader, train_dataset, generator, discriminator = initialize_training(config, device)
 
@@ -139,7 +199,13 @@ def main():
 
     hwfr = config['data']['hwfr']
     img_to_patch = ImgToPatch(generator.ray_sampler, hwfr[:3])
-    
+
+    # Reconstruction loss: 跟 CCSRLoss 同一個東西（L1 + VGG perceptual）
+    # 但這次直接用在 NeRF 輸出上
+    if use_recon:
+        recon_loss_fn = CCSRLoss(device=device)
+        print(f"[Recon] Loss = L1 + 0.5 × VGG perceptual")
+
     checkpoint_io = CheckpointIO(checkpoint_dir=checkpoint_dir)
     checkpoint_io.register_modules(
         discriminator=discriminator,
@@ -156,9 +222,10 @@ def main():
     if fid_every > 0:
         fid_cache_file = os.path.join(out_dir, 'fid_cache_train.npz')
         kid_cache_file = os.path.join(out_dir, 'kid_cache_train.npz')
-        evaluator.inception_eval.initialize_target(val_loader, cache_file=fid_cache_file, act_cache_file=kid_cache_file)
+        evaluator.inception_eval.initialize_target(
+            val_loader, cache_file=fid_cache_file, act_cache_file=kid_cache_file
+        )
     
-    # 預先快取各實驗的 hidden_state
     cached_hidden_states = {}
     for exp_name, hs in train_dataset.hidden_state.items():
         cached_hidden_states[exp_name] = hs.to(device)
@@ -169,7 +236,7 @@ def main():
     for i, k1 in enumerate(hs_keys):
         for k2 in hs_keys[i+1:]:
             diff = (cached_hidden_states[k1] - cached_hidden_states[k2]).norm().item()
-            cos_sim = torch.nn.functional.cosine_similarity(
+            cos_sim = F.cosine_similarity(
                 cached_hidden_states[k1].unsqueeze(0),
                 cached_hidden_states[k2].unsqueeze(0)
             ).item()
@@ -178,16 +245,38 @@ def main():
 
     fid_best = float('inf')
     kid_best = float('inf')
-    
     it = epoch_idx = -1
     tstart = t0 = time.time()
+
+    # ========================================================
+    # 新增：載入 checkpoint 恢復訓練
+    # ========================================================
+    if args.resume is not None:
+        print(f"\n[Resume] Loading checkpoint: {args.resume}")
+        try:
+            load_scalars = checkpoint_io.load(args.resume)
+            # 恢復 iteration 和 epoch
+            it = load_scalars.get('it', -1)
+            epoch_idx = load_scalars.get('epoch_idx', -1)
+            fid_best = load_scalars.get('fid_best', float('inf'))
+            kid_best = load_scalars.get('kid_best', float('inf'))
+            print(f"[Resume] Restored: it={it}, epoch_idx={epoch_idx}, "
+                  f"fid_best={fid_best:.4f}, kid_best={kid_best:.4f}")
+            print(f"[Resume] Training will continue from iteration {it + 1}")
+        except FileNotFoundError:
+            print(f"[Resume] ERROR: Checkpoint file '{args.resume}' not found!")
+            print(f"[Resume] Looked in: {checkpoint_dir}")
+            print(f"[Resume] Available checkpoints:")
+            ckpt_files = glob.glob(os.path.join(checkpoint_dir, '*.pt'))
+            for f in sorted(ckpt_files):
+                print(f"  - {os.path.basename(f)}")
+            if not ckpt_files:
+                print("  (none found)")
+            raise
+    # ========================================================
     
     g_scheduler = build_lr_scheduler(g_optimizer, config, last_epoch=it)
     d_scheduler = build_lr_scheduler(d_optimizer, config, last_epoch=it)
-
-    def ccsr_to_flat(x):
-        """[B, 3, H, W] -> [B*H*W, 3]"""
-        return x.permute(0, 2, 3, 1).reshape(-1, 3)
 
     @contextmanager
     def amp_context():
@@ -197,12 +286,12 @@ def main():
         else:
             yield
 
-    # ========================================================
-    # [預先解析] v_list — FID 跟 Sample 都要用
-    # ========================================================
     v_list = [float(x.strip()) for x in config['data']['v'].split(",")]
     n_heights = len(v_list)
 
+    # ========================================================
+    # Training Loop
+    # ========================================================
     while True:
         epoch_idx += 1
         for x_real, label, hidden_state in tqdm(train_loader, desc=f"Epoch {epoch_idx}"):
@@ -219,6 +308,7 @@ def main():
             discriminator.train()
 
             # ==================== Discriminator Step ====================
+            # （跟原本完全一樣，不受 reconstruction loss 影響）
             d_optimizer.zero_grad()
 
             rgbs = img_to_patch(x_real)
@@ -234,20 +324,14 @@ def main():
             reg = reg_param * compute_grad2(d_real.float(), rgbs).mean()
 
             with torch.no_grad(), amp_context():
-                if use_ccsr:
-                    rgb_nerf, _, ccsr_out = generator(
-                        z, label, hidden_state, return_ccsr_output=True
-                    )
-                    x_fake_for_d = ccsr_to_flat(ccsr_out)
-                else:
-                    rgb_nerf, _ = generator(z, label, hidden_state)
-                    x_fake_for_d = rgb_nerf
+                rgb_nerf, _ = generator(z, label, hidden_state)
+                x_fake_for_d = rgb_nerf
 
             with amp_context():
-                d_fake = discriminator(rgb_nerf, hidden_state)
+                d_fake = discriminator(x_fake_for_d, hidden_state)
                 dloss_fake = compute_loss(d_fake, 0)
 
-            total_d_loss = dloss_real + dloss_fake + reg + aux_loss_weight * (aux_loss_real)
+            total_d_loss = dloss_real + dloss_fake + reg + aux_loss_weight * aux_loss_real
 
             if use_scaler:
                 scaler.scale(total_d_loss).backward()
@@ -272,21 +356,77 @@ def main():
             z = zdist.sample((batch_size,))
 
             with amp_context():
-                if use_ccsr:
-                    rgb_nerf, _, ccsr_out = generator(
-                        z, label, hidden_state, return_ccsr_output=True
+                if use_recon:
+                    # ====================================================
+                    # GAN + Reconstruction Loss
+                    #
+                    # 手動 sample rays → 記住 hw 座標
+                    # → NeRF 渲染 64×64
+                    # → 用 hw 從 x_real 提取同位置的 64×64 patch
+                    # → L1 + VGG loss
+                    # ====================================================
+
+                    # Step 1: 手動 sample rays，記住 hw
+                    all_rays = []
+                    all_hw = []
+                    for i in range(batch_size):
+                        height_idx = int(label[i, 7].item())
+                        angle_idx = int(label[i, 8].item())
+                        selected_u = angle_idx / 360
+                        selected_v = v_list[height_idx % n_heights]
+                        pose_i = generator.sample_select_pose(selected_u, selected_v)
+                        batch_rays_i, _, hw_i = generator.ray_sampler(
+                            generator.H, generator.W, generator.focal, pose_i
+                        )
+                        all_rays.append(batch_rays_i)
+                        all_hw.append(hw_i)
+                    rays = torch.cat(all_rays, dim=1)
+
+                    # Step 2: NeRF 渲染（用外部 rays，帶梯度）
+                    rgb_nerf, _ = generator(z, label, hidden_state, rays=rays)
+                    # rgb_nerf: [B*4096, 3], range [-1, 1]
+
+                    # Step 3: GAN loss
+                    d_fake, aux_fake = discriminator(
+                        rgb_nerf, hidden_state, return_aux=True
                     )
-                    ccsr_flat = ccsr_to_flat(ccsr_out)
-                    d_fake = discriminator(ccsr_flat, hidden_state)
-                    gloss_adv = compute_loss(d_fake, 1)
-                    consistency_loss = F.l1_loss(ccsr_flat, rgb_nerf)
-                    gloss = gloss_adv + lambda_ccsr * consistency_loss
-                else:
-                    rgb_nerf, _ = generator(z, label, hidden_state)
-                    d_fake, aux_fake = discriminator(rgb_nerf, hidden_state, return_aux=True)
                     gloss_adv = compute_loss(d_fake, 1)
                     gloss_aux = F.mse_loss(aux_fake, hidden_state)
-                    consistency_loss = torch.tensor(0.0, device=device)
+
+                    # Step 4: Reconstruction loss
+                    # reshape flat → 2D patch（保留梯度到 NeRF）
+                    patch_size = int(np.sqrt(rgb_nerf.shape[0] // batch_size))
+                    nerf_patch = rgb_nerf.view(
+                        batch_size, patch_size, patch_size, 3
+                    ).permute(0, 3, 1, 2).contiguous()
+                    # nerf_patch: [B, 3, 64, 64], range [-1, 1]
+
+                    # 從 x_real 提取同位置的 real patch
+                    real_patch = extract_real_patches(
+                        x_real, all_hw,
+                        target_size=(patch_size, patch_size),
+                        device=device
+                    )
+                    # real_patch: [B, 3, 64, 64], range [-1, 1]
+
+                    recon_loss = recon_loss_fn(nerf_patch, real_patch)
+
+                    # Step 5: 加總
+                    gloss = (gloss_adv
+                             + lambda_recon * recon_loss
+                             + aux_loss_weight * gloss_aux)
+
+                else:
+                    # ====================================================
+                    # 原始 GAN-only（無 reconstruction loss）
+                    # ====================================================
+                    rgb_nerf, _ = generator(z, label, hidden_state)
+                    d_fake, aux_fake = discriminator(
+                        rgb_nerf, hidden_state, return_aux=True
+                    )
+                    gloss_adv = compute_loss(d_fake, 1)
+                    gloss_aux = F.mse_loss(aux_fake, hidden_state)
+                    recon_loss = torch.tensor(0.0, device=device)
                     gloss = gloss_adv + aux_loss_weight * gloss_aux
 
             if use_scaler:
@@ -302,6 +442,11 @@ def main():
             current_lr_g = g_optimizer.param_groups[0]['lr']
             current_lr_d = d_optimizer.param_groups[0]['lr']
 
+            # ==================== Logging ====================
+            # 修正：用一個 dict 收集所有 log，最後只呼叫一次 wandb.log()
+            # 避免同一個 iteration 多次 log 造成重複 panel
+            log_dict = None
+
             if (it + 1) % config['training']['print_every'] == 0:
                 log_dict = {
                     "loss/generator_total": gloss.item(),
@@ -314,46 +459,53 @@ def main():
                     "loss/regularizer": reg.item(),
                     "learning rate/generator": current_lr_g,
                     "learning rate/discriminator": current_lr_d,
-                    "iteration": it,
                 }
-                if use_ccsr:
-                    log_dict["loss/ccsr_consistency"] = consistency_loss
-                wandb.log(log_dict)
+                if use_recon:
+                    log_dict["loss/recon"] = recon_loss.item()
 
-            # ==================== Sample (多 specimen 對比) ====================
-            if ((it % config['training']['sample_every']) == 0) or ((it < 5000) and (it % 200 == 0)):
-                angle_positions = [(i/8, 0.5) for i in range(8)]
-                plist = [generator.sample_select_pose(u, v) for (u, v) in angle_positions]
+            # ==================== Sample ====================
+            if ((it % config['training']['sample_every']) == 0) or \
+               ((it < 5000) and (it % 200 == 0)):
+                angle_positions = [(i / 8, 0.5) for i in range(8)]
+                plist = [generator.sample_select_pose(u, v)
+                         for (u, v) in angle_positions]
                 ptest = torch.stack(plist)
                 angles = [0, 45, 90, 135, 180, 225, 270, 315]
 
-                # 所有可用的 specimen
                 specimens_to_sample = {
-                    'RS307': [1.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0],
-                    'RS330': [1.0, 0.0,  0.0, 0.0, 1.0,  1.0, 0.0],
-                    'RS615': [0.0, 1.0,  0.0, 1.0, 0.0,  1.0, 0.0],
-                    'RS315': [1.0, 0.0,  0.0, 1.0, 0.0,  1.0, 0.0],
+                    'RS307': [1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                    'RS330': [1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0],
+                    'RS615': [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+                    'RS315': [1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0],
                 }
 
-                # 用同一組 z,這樣差異可以歸因於 conditioning
                 ztest = zdist.sample((8,))
-                rgb_panels = []
-                depth_panels = []
-                acc_panels = []
+                rgb_panels, depth_panels, acc_panels = [], [], []
                 spec_names_shown = []
 
                 for spec_name, vec in specimens_to_sample.items():
                     if spec_name not in cached_hidden_states:
                         continue
-
                     test_labels_list = [vec + [0.5, float(a)] for a in angles]
-                    label_test_all = torch.tensor(test_labels_list, dtype=torch.float32).to(device)
+                    label_test = torch.tensor(
+                        test_labels_list, dtype=torch.float32
+                    ).to(device)
                     hs_spec = cached_hidden_states[spec_name]
                     hs_test = hs_spec.unsqueeze(0).expand(8, -1)
 
                     rgb, depth, acc = evaluator.create_samples(
-                        ztest.to(device), label_test_all, hs_test, ptest
+                        ztest.to(device), label_test, hs_test, ptest
                     )
+
+                    if depth.dim() == 3:
+                        depth = depth.unsqueeze(1)
+                    if depth.shape[1] == 1:
+                        depth = depth.expand(-1, 3, -1, -1)
+                    if acc.dim() == 3:
+                        acc = acc.unsqueeze(1)
+                    if acc.shape[1] == 1:
+                        acc = acc.expand(-1, 3, -1, -1)
+
                     rgb_panels.append(rgb.detach().cpu())
                     depth_panels.append(depth.detach().cpu())
                     acc_panels.append(acc.detach().cpu())
@@ -363,101 +515,112 @@ def main():
                     rgb_all = torch.cat(rgb_panels, dim=0)
                     depth_all = torch.cat(depth_panels, dim=0)
                     acc_all = torch.cat(acc_panels, dim=0)
-
                     grid_rgb = vutils.make_grid(rgb_all, nrow=8, normalize=True)
                     grid_depth = vutils.make_grid(depth_all, nrow=8, normalize=True)
                     grid_acc = vutils.make_grid(acc_all, nrow=8, normalize=True)
+                    caption = f"iter {it} | {' / '.join(spec_names_shown)}"
 
-                    caption = f"iter {it} | rows: {' / '.join(spec_names_shown)}"
-                    wandb.log({
-                        "sample/rgb": wandb.Image(grid_rgb, caption=caption),
-                        "sample/depth": wandb.Image(grid_depth, caption=caption),
-                        "sample/acc": wandb.Image(grid_acc, caption=caption),
-                        "epoch_idx": epoch_idx,
-                        "iteration": it,
-                    })
+                    # 合併到同一個 log_dict，不要單獨 wandb.log()
+                    if log_dict is None:
+                        log_dict = {}
+                    log_dict["sample/rgb"] = wandb.Image(grid_rgb, caption=caption)
+                    log_dict["sample/depth"] = wandb.Image(grid_depth, caption=caption)
+                    log_dict["sample/acc"] = wandb.Image(grid_acc, caption=caption)
 
-            # ==================== FID/KID (with pose reconstruction) ====================
-            if fid_every > 0 and ((it + 1) % fid_every) == 0:
+            # ==================== FID/KID ====================
+            if fid_every > 0 and ((it + 1) % fid_every == 0):
+                def pose_from_label(gen, label_i, v_list_local):
+                    height_idx = int(label_i[7].item())
+                    angle_idx = int(label_i[8].item())
+                    u = angle_idx / 360.0
+                    v = v_list_local[height_idx % len(v_list_local)]
+                    return gen.sample_select_pose(u, v)
 
-                all_conditions = []
-                for spec_name, hs in cached_hidden_states.items():
-                    spec_key = spec_name + '_n'
-                    if spec_key in train_dataset.specimen_props:
-                        props = train_dataset.specimen_props[spec_key]
-                        label_vec_7d = props['AR'] + props['LR'] + props['TR']
-                        all_conditions.append((
-                            torch.tensor(label_vec_7d, dtype=torch.float32),
-                            hs
-                        ))
+                n_dataset = len(train_dataset)
 
                 def matched_sample_gen():
                     while True:
-                        cond_idxs = np.random.randint(0, len(all_conditions), size=batch_size)
-                        label_7d_list = [all_conditions[i][0] for i in cond_idxs]
-                        hs_list = [all_conditions[i][1] for i in cond_idxs]
-
-                        full_labels = []
-                        for label_7d in label_7d_list:
-                            height_idx = float(np.random.randint(0, n_heights))
-                            angle_idx = float(np.random.randint(0, 360))
-                            view_part = torch.tensor([height_idx, angle_idx], dtype=torch.float32)
-                            full_label = torch.cat([label_7d, view_part], dim=0)
-                            full_labels.append(full_label)
-
-                        label_batch = torch.stack(full_labels).to(device)   # [B, 9]
-                        hs_batch = torch.stack(hs_list).to(device)          # [B, 1024]
-
-                        # ============================================================
-                        # [修正] 從 label 重建 pose,跟 eval.py / CCSR eval 一致
-                        # 確保 train FID 跟 eval FID 可比較
-                        # ============================================================
+                        indices = np.random.choice(
+                            n_dataset, size=batch_size, replace=False
+                        )
+                        labels_list, hs_list = [], []
+                        for idx in indices:
+                            _, label_i, hs_i = train_dataset[idx]
+                            labels_list.append(label_i)
+                            hs_list.append(hs_i)
+                        label_batch = torch.stack(labels_list).to(device)
+                        hs_batch = torch.stack(hs_list).to(device)
                         poses = torch.stack([
-                            generator.sample_select_pose(
-                                int(label_batch[i, 8].item()) / 360.0,
-                                v_list[int(label_batch[i, 7].item())]
-                            )
+                            pose_from_label(generator, label_batch[i], v_list)
                             for i in range(batch_size)
                         ])
-
-                        z = zdist.sample((batch_size,))
+                        z_fid = zdist.sample((batch_size,))
                         with torch.no_grad():
-                            rgb, _, _ = evaluator.create_samples(z, label_batch, hs_batch, poses)
-                        rgb = (rgb / 2 + 0.5).mul_(255).clamp_(0, 255).to(torch.uint8).to(torch.float) / 255. * 2 - 1
+                            rgb, _, _ = evaluator.create_samples(
+                                z_fid, label_batch, hs_batch, poses
+                            )
+                        rgb = (rgb / 2 + 0.5).mul_(255).clamp_(0, 255) \
+                              .to(torch.uint8).to(torch.float) / 255. * 2 - 1
                         yield rgb.cpu()
 
-                fid, kid = evaluator.compute_fid_kid(None, None, sample_generator=matched_sample_gen())
-                wandb.log({"validation/fid": fid, "validation/kid": kid, "iteration": it})
+                fid, kid = evaluator.compute_fid_kid(
+                    None, None, sample_generator=matched_sample_gen()
+                )
+
+                # 合併到同一個 log_dict
+                if log_dict is None:
+                    log_dict = {}
+                log_dict["validation/fid"] = fid
+                log_dict["validation/kid"] = kid
+
                 torch.cuda.empty_cache()
 
                 if save_best == 'fid' and fid < fid_best:
                     fid_best = fid
                     print('Saving best model based on FID...')
                     wandb.run.summary["best_fid"] = fid_best
-                    checkpoint_io.save('model_best.pt', it=it, epoch_idx=epoch_idx, fid_best=fid_best, kid_best=kid_best, save_to_wandb=True)
+                    checkpoint_io.save(
+                        'model_best.pt', it=it, epoch_idx=epoch_idx,
+                        fid_best=fid_best, kid_best=kid_best,
+                        save_to_wandb=True
+                    )
                     torch.cuda.empty_cache()
                 elif save_best == 'kid' and kid < kid_best:
                     kid_best = kid
                     print('Saving best model based on KID...')
                     wandb.run.summary["best_kid"] = kid_best
-                    checkpoint_io.save('model_best.pt', it=it, epoch_idx=epoch_idx, fid_best=fid_best, kid_best=kid_best, save_to_wandb=True)
+                    checkpoint_io.save(
+                        'model_best.pt', it=it, epoch_idx=epoch_idx,
+                        fid_best=fid_best, kid_best=kid_best,
+                        save_to_wandb=True
+                    )
                     torch.cuda.empty_cache()
 
+            # ==================== 統一 wandb.log() ====================
+            # 每個 iteration 最多只呼叫一次 wandb.log()，用 step=it 固定 x 軸
+            if log_dict is not None:
+                wandb.log(log_dict, step=it)
+
+            # ==================== Checkpoint ====================
             if ((it + 1) % 10000) == 0:
                 print('Saving backup...')
-                checkpoint_io.save('model_%08d.pt' % it, it=it, epoch_idx=epoch_idx, save_to_wandb=True)
+                checkpoint_io.save(
+                    'model_%08d.pt' % it, it=it, epoch_idx=epoch_idx,
+                    fid_best=fid_best, kid_best=kid_best,
+                    save_to_wandb=True
+                )
 
             if time.time() - t0 > config['training']['save_every']:
                 checkpoint_io.save(
-                    config['training']['model_file'], 
-                    it=it, 
-                    epoch_idx=epoch_idx,
+                    config['training']['model_file'],
+                    it=it, epoch_idx=epoch_idx,
+                    fid_best=fid_best, kid_best=kid_best,
                     save_to_wandb=True
                 )
                 t0 = time.time()
-                
                 if (restart_every > 0 and t0 - tstart > restart_every):
                     return
+
 
 if __name__ == '__main__':
     main()
