@@ -118,6 +118,7 @@ def build_models(config, disc=True):
             'hflip': config['discriminator']['hflip'],
             'hidden_dim': config['discriminator'].get('hidden_dim', 1024),
             'cond_dim': config['discriminator'].get('cond_dim', 256),  # 改預設值對齊 yaml
+            'num_classes' : config['nerf']['num_classes'],
             'shared_cond_proj': shared_cond_proj,
         }
         discriminator = Discriminator(**disc_kwargs)

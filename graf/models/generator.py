@@ -71,8 +71,8 @@ class Generator(object):
                 all_rays = []
                 for i in range(label.size(0)):
                     # 唯一還在用 label 的地方:抽 view 參數
-                    height_idx = int(label[i, 7].item())
-                    angle_idx = int(label[i, 8].item())
+                    height_idx = int(label[i, 14].item())
+                    angle_idx = int(label[i, 15].item())
                     selected_u = angle_idx / 360
                     selected_v = self._v_list[height_idx]
                     rays_i = self.sample_select_rays(selected_u, selected_v)
@@ -87,9 +87,13 @@ class Generator(object):
         # [清理] 不再把 label 傳給 render
         # render 路徑只需要 hidden_state，因為 NeRF 內部不用 AR/LR/TR
         # ========================================================
+        # specimen_onehot = label[:, :7]
+        mat_feat = label[:, 7:14]
         rgb, disp, acc, extras = render(
             self.H, self.W, self.focal,
             hidden_state,
+            # specimen_onehot,
+            mat_feat,
             chunk=self.chunk, rays=rays,
             **render_kwargs
         )

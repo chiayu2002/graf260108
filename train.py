@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from graf.gan_training import Evaluator
 from graf.config import get_data, build_models, load_config, save_config, build_lr_scheduler
 from graf.utils import get_zdist
-from graf.train_step import compute_grad2, compute_loss, toggle_grad, CCSRLoss
+from graf.train_step import compute_grad2, compute_loss, toggle_grad, CCSRLoss, MCE_Loss
 from graf.transforms import ImgToPatch
 
 from GAN_stability.gan_training.checkpoints_mod import CheckpointIO
@@ -117,7 +117,7 @@ def extract_real_patches(x_real, all_hw, target_size, device):
 def main():
     set_random_seed(0)
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', default='configs/default.yaml')
+    parser.add_argument('--config', default='configs/recon.yaml')
     # ============ 新增：checkpoint resume 參數 ============
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint file to resume training. '
@@ -189,6 +189,8 @@ def main():
         f.write('-' * 50 + '\n')
         pprint.pprint(generator.module_dict, stream=f)
     wandb.save(file_path)
+
+    criterion_cls = MCE_Loss().to(device)
 
     lr_g = config['training']['lr_g']
     lr_d = config['training']['lr_d']
@@ -299,6 +301,8 @@ def main():
 
             x_real = x_real.to(device)
             label = label.to(device)
+            # specimen_onehot = label[:,:7]
+            mat = label[:, 7:14]
             hidden_state = hidden_state.to(device)
 
             generator.ray_sampler.iterations = it
@@ -317,9 +321,13 @@ def main():
             z = zdist.sample((batch_size,))
 
             with amp_context():
-                d_real, aux_real = discriminator(rgbs, hidden_state, return_aux=True)
+                d_real, aux_real, label_real = discriminator(rgbs, label, hidden_state, return_aux=True)
                 dloss_real = compute_loss(d_real, 1)
                 aux_loss_real = F.mse_loss(aux_real, hidden_state)
+                # label_onehot = label_real[:,:7].view(8, 7)
+                label_mat = label_real#[:, 7:].view(8, 7)
+                # onehot_loss_real = criterion_cls([7], label_onehot, onehot)
+                mat_loss_real = F.mse_loss(label_mat, mat)
 
             reg = reg_param * compute_grad2(d_real.float(), rgbs).mean()
 
@@ -328,10 +336,10 @@ def main():
                 x_fake_for_d = rgb_nerf
 
             with amp_context():
-                d_fake = discriminator(x_fake_for_d, hidden_state)
+                d_fake = discriminator(x_fake_for_d, label, hidden_state)
                 dloss_fake = compute_loss(d_fake, 0)
 
-            total_d_loss = dloss_real + dloss_fake + reg + aux_loss_weight * aux_loss_real
+            total_d_loss = dloss_real + dloss_fake + reg + aux_loss_real + mat_loss_real
 
             if use_scaler:
                 scaler.scale(total_d_loss).backward()
@@ -370,8 +378,8 @@ def main():
                     all_rays = []
                     all_hw = []
                     for i in range(batch_size):
-                        height_idx = int(label[i, 7].item())
-                        angle_idx = int(label[i, 8].item())
+                        height_idx = int(label[i, 14].item())
+                        angle_idx = int(label[i, 15].item())
                         selected_u = angle_idx / 360
                         selected_v = v_list[height_idx % n_heights]
                         pose_i = generator.sample_select_pose(selected_u, selected_v)
@@ -387,11 +395,15 @@ def main():
                     # rgb_nerf: [B*4096, 3], range [-1, 1]
 
                     # Step 3: GAN loss
-                    d_fake, aux_fake = discriminator(
-                        rgb_nerf, hidden_state, return_aux=True
+                    d_fake, aux_fake, label_fake = discriminator(
+                        rgb_nerf, label, hidden_state, return_aux=True
                     )
                     gloss_adv = compute_loss(d_fake, 1)
                     gloss_aux = F.mse_loss(aux_fake, hidden_state)
+                    # label_onehot = label_fake[:,:7].view(8, 7)
+                    label_mat = label_fake#[:, 7:].view(8, 7)
+                    # onehot_loss_fake = criterion_cls([7], label_onehot, onehot)
+                    mat_loss_fake = F.mse_loss(label_mat, mat)
 
                     # Step 4: Reconstruction loss
                     # reshape flat → 2D patch（保留梯度到 NeRF）
@@ -414,7 +426,7 @@ def main():
                     # Step 5: 加總
                     gloss = (gloss_adv
                              + lambda_recon * recon_loss
-                             + aux_loss_weight * gloss_aux)
+                             + gloss_aux + mat_loss_fake)
 
                 else:
                     # ====================================================
@@ -452,8 +464,12 @@ def main():
                     "loss/generator_total": gloss.item(),
                     "loss/generator_adv": gloss_adv.item(),
                     "loss/generator_label": gloss_aux.item(),
+                    # "loss/generator_onehot": onehot_loss_fake.item(),
+                    "loss/generator_mat": mat_loss_fake.item(),
                     "loss/discriminator": total_d_loss.item(),
                     "loss/discriminator_reallabel": aux_loss_real.item(),
+                    # "loss/discriminator_onehot": onehot_loss_real.item(),
+                    "loss/discriminator_mat": mat_loss_real.item(),
                     "loss/dloss_real": dloss_real.item(),
                     "loss/dloss_fake": dloss_fake.item(),
                     "loss/regularizer": reg.item(),
@@ -479,6 +495,13 @@ def main():
                     'RS315': [1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0],
                 }
 
+                material_features_map = {
+                    'RS307': [0.0000, 0.1906, 0.8342, 0.1000, 1.0000, 0.0589, 0.1081],
+                    'RS315': [0.0062, 0.4365, 0.6020, 0.6261, 0.0064, 0.6284, 0.6530],
+                    'RS330': [0.0088, 1.0000, 1.0000, 1.0000, 0.0000, 1.0000, 1.0000],
+                    'RS615': [1.0000, 0.0000, 0.0000, 0.0000, 0.5826, 0.0000, 0.0000],
+                }
+
                 ztest = zdist.sample((8,))
                 rgb_panels, depth_panels, acc_panels = [], [], []
                 spec_names_shown = []
@@ -486,7 +509,15 @@ def main():
                 for spec_name, vec in specimens_to_sample.items():
                     if spec_name not in cached_hidden_states:
                         continue
-                    test_labels_list = [vec + [0.5, float(a)] for a in angles]
+                    
+                    # 取得對應標本的材料特徵
+                    # 如果 spec_name 不在 map 中，建議加個 get() 或判斷以防報錯
+                    mat_feat = material_features_map.get(spec_name, [])
+                    
+                    # 構建新的標籤列表：
+                    # 原始向量(vec) + 材料特徵(mat_feat) + 角度(a)
+                    test_labels_list = [vec + mat_feat + [float(a)] for a in angles]
+                    
                     label_test = torch.tensor(
                         test_labels_list, dtype=torch.float32
                     ).to(device)

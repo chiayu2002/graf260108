@@ -1,4 +1,4 @@
-expname: column20260504_recon_loss_per1.0_rec0.5_scale_anneal_label0.5
+expname: column20260506_recon_loss_per1.0_rec0.5_scale_anneal_label0.5_mat_lrd1
 data:
   datadir: [data/RS307_n, data/RS330_n, data/RS615_n]
   extractor_path: /Data/home/vicky/graf260108_im64/HystereticGRU/2026-03-24_17-13-01/Opensees Based damage Patterns Generation/c7d0zrxf/checkpoints/best.ckpt
@@ -34,7 +34,7 @@ nerf:
   N_importance: 0
   netdepth_fine: 8
   netwidth_fine: 256
-  num_classes: 12
+  num_classes: 7
 ray_sampler:
   N_samples: 4096          # 64×64, NeRF 解析度不降
   max_scale: 1.0
@@ -49,7 +49,7 @@ training:
   gan_type: standard
   lr_anneal: 0.5
   lr_anneal_every: 80000,120000,150000
-  lr_d: 0.00005
+  lr_d: 0.0001
   lr_g: 0.0003
   model_average_beta: 0.999
   model_average_reinit: false
@@ -81,4 +81,4 @@ reconstruction:
 wandb:
   project: graf260108
   entity: vicky20020808
-  name: column20260504_recon_loss_per1.0_rec0.5_scale_anneal_label0.5
+  name: column20260506_recon_loss_per1.0_rec0.5_scale_anneal_label0.5_mat_lrd1

@@ -71,7 +71,7 @@ def get_embedder(multires, i=0):
 # Model
 class NeRF(nn.Module):
     def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3,
-                 output_ch=4, skips=[4], use_viewdirs=False, **kwargs):
+                 output_ch=4, skips=[4], numclasses=4, use_viewdirs=False, **kwargs):
         super(NeRF, self).__init__()
         self.D = D
         self.W = W
@@ -79,11 +79,12 @@ class NeRF(nn.Module):
         self.input_ch_views = input_ch_views
         self.skips = skips
         self.use_viewdirs = use_viewdirs
+        self.numclasses = numclasses
 
         self.pts_linears = nn.ModuleList(
-            [nn.Linear(input_ch + W, W)] +
+            [nn.Linear(input_ch + W + numclasses, W)] +
             [nn.Linear(W, W) if i not in self.skips
-             else nn.Linear(W + input_ch + W, W) for i in range(D-1)]
+             else nn.Linear(W + input_ch + W + numclasses, W) for i in range(D-1)]
         )
         self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W//2)])
 

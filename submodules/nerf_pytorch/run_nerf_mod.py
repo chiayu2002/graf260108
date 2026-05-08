@@ -31,7 +31,8 @@ def batchify(fn, chunk):
 
 
 def run_network(inputs, viewdirs, fn, hidden_state, embed_fn, embeddirs_fn,
-                features=None, netchunk=1024*64):
+                features=None, netchunk=1024*64,
+                mat_feat=None):
     """輸出 rgb and sigma — 不再需要 label"""
     inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
     embedded = embed_fn(inputs_flat)
@@ -42,7 +43,16 @@ def run_network(inputs, viewdirs, fn, hidden_state, embed_fn, embeddirs_fn,
 
     # 預先投影 1024 → 256 再 expand,省記憶體
     hidden_state_projected = fn.condition_feature(hidden_state)
-    hidden_state_expanded = hidden_state_projected.repeat_interleave(
+
+    # ── 新增：concat specimen_onehot 和 mat_feat ──────────────
+    extra_list = [hidden_state_projected]
+    # if specimen_onehot is not None:
+    #     extra_list.append(specimen_onehot.float())          # [B, 3]
+    if mat_feat is not None:
+        extra_list.append(mat_feat.float())                 # [B, 7]
+    hidden_state_enhanced = torch.cat(extra_list, dim=-1)  # [B, 256+3+7=266]
+
+    hidden_state_expanded = hidden_state_enhanced.repeat_interleave(
         points_per_batch, dim=0
     ).float()
 
@@ -62,13 +72,13 @@ def run_network(inputs, viewdirs, fn, hidden_state, embed_fn, embeddirs_fn,
     return outputs
 
 
-def batchify_rays(rays_flat, hidden_state, chunk=1024*32, **kwargs):
+def batchify_rays(rays_flat, hidden_state,  mat_feat,chunk=1024*32, **kwargs):
     all_ret = {}
     features = kwargs.get('features')
     for i in range(0, rays_flat.shape[0], chunk):
         if features is not None:
             kwargs['features'] = features[i:i+chunk]
-        ret = render_rays(rays_flat[i:i+chunk], hidden_state[i:i+chunk], **kwargs)
+        ret = render_rays(rays_flat[i:i+chunk], hidden_state[i:i+chunk], mat_feat[i:i+chunk], **kwargs)
         for k in ret:
             if k not in all_ret:
                 all_ret[k] = []
@@ -77,7 +87,7 @@ def batchify_rays(rays_flat, hidden_state, chunk=1024*32, **kwargs):
     return all_ret
 
 
-def render(H, W, focal, hidden_state, chunk=1024*32, rays=None, c2w=None,
+def render(H, W, focal, hidden_state, mat_feat, chunk=1024*32, rays=None, c2w=None,
            ndc=True, near=0., far=1., use_viewdirs=False, c2w_staticcam=None,
            **kwargs):
     if c2w is not None:
@@ -107,6 +117,14 @@ def render(H, W, focal, hidden_state, chunk=1024*32, rays=None, c2w=None,
         -1, hidden_state.shape[-1]
     )
 
+    # specimen_onehot = torch.tensor(specimen_onehot, dtype=torch.float32).to(device)
+    # specimen_onehot_per_ray = specimen_onehot.unsqueeze(1).repeat(1, rays_per_img, 1).view(
+    #     -1, specimen_onehot.shape[-1])
+
+    mat_feat = torch.tensor(mat_feat, dtype=torch.float32).to(device)
+    mat_feat_per_ray = mat_feat.unsqueeze(1).repeat(1, rays_per_img, 1).view(
+        -1, mat_feat.shape[-1])
+
     if use_viewdirs:
         rays = torch.cat([rays, viewdirs], -1)
 
@@ -115,7 +133,7 @@ def render(H, W, focal, hidden_state, chunk=1024*32, rays=None, c2w=None,
         N_rays = sh[0] // bs_f
         kwargs['features'] = kwargs['features'].unsqueeze(1).expand(-1, N_rays, -1).flatten(0, 1)
 
-    all_ret = batchify_rays(rays, hidden_state_per_ray, chunk, **kwargs)
+    all_ret = batchify_rays(rays, hidden_state_per_ray, mat_feat_per_ray, chunk, **kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = torch.reshape(all_ret[k], k_sh)
@@ -136,9 +154,13 @@ def create_nerf(args):
         embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
     output_ch = 5 if args.N_importance > 0 else 4
     skips = [3]
+
+    # ── 新增：cond_extra_dim = specimen(3) + mat_feat(7) ──
+    cond_extra_dim = getattr(args, 'num_classes', 10)
+
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
-                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs, numclasses=args.num_class)
+                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs, numclasses=cond_extra_dim)
     grad_vars = list(model.parameters())
     named_params = list(model.named_parameters())
 
@@ -150,14 +172,17 @@ def create_nerf(args):
         grad_vars += list(model_fine.parameters())
         named_params = list(model_fine.named_parameters())
 
-    network_query_fn = lambda inputs, viewdirs, network_fn, hidden_state, features: run_network(
+    network_query_fn = lambda inputs, viewdirs, network_fn, hidden_state, features, \
+                               mat_feat=None: run_network(
     inputs, viewdirs, network_fn, hidden_state,
     features=features,
     embed_fn=embed_fn,
     embeddirs_fn=embeddirs_fn,
     netchunk=args.netchunk,
+    # specimen_onehot=specimen_onehot,
+    mat_feat=mat_feat,
     )
-
+#specimen_onehot=None,
     render_kwargs_train = {             
         'network_query_fn' : network_query_fn,
         'perturb' : args.perturb,
@@ -205,7 +230,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, pytest=False):
     return rgb_map, disp_map, acc_map, weights, depth_map
 
 
-def render_rays(ray_batch, hidden_state,
+def render_rays(ray_batch, hidden_state, mat_feat,
                 network_fn, network_query_fn, N_samples,
                 features=None, retraw=False, lindisp=False,
                 perturb=0., N_importance=0, network_fine=None,
@@ -235,7 +260,7 @@ def render_rays(ray_batch, hidden_state,
 
     pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]
 
-    raw = network_query_fn(pts, viewdirs, network_fn, hidden_state, features)
+    raw = network_query_fn(pts, viewdirs, network_fn, hidden_state, features, mat_feat)
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
         raw, z_vals, rays_d, raw_noise_std, pytest=pytest
     )

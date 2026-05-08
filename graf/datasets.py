@@ -34,6 +34,15 @@ class ImageDataset(VisionDataset):
         self.hysteresis = {}
         self.hidden_state = self.get_hidden_state(extractor, self.exp_list, result_dir=result_dir)
 
+         # ── 新增：每個 specimen 的 7 個正規化材料特徵 ──────────────
+        # 欄位順序: displacement, force, corner_σ, corner_ε, core_σ, core_ε, cover_ε
+        self.material_features = {
+            "RS315_n": [0.0062, 0.4365, 0.6020, 0.6261, 0.0064, 0.6284, 0.6530],
+            "RS307_n": [0.0000, 0.1906, 0.8342, 0.1000, 1.0000, 0.0589, 0.1081],
+            "RS330_n": [0.0088, 1.0000, 1.0000, 1.0000, 0.0000, 1.0000, 1.0000],
+            "RS615_n": [1.0000, 0.0000, 0.0000, 0.0000, 0.5826, 0.0000, 0.0000],
+        }
+
         self.height_map = {
             "0_": 0,    
             "0.5_": 1,  
@@ -87,13 +96,16 @@ class ImageDataset(VisionDataset):
                 vec_LR = props["LR"]
                 vec_TR = props["TR"]
 
+                # ── 新增：取出該 specimen 的材料特徵 ──
+                vec_mat = self.material_features.get(specimen_name, [0.0] * 7)
+
                 for category_prefix, category_idx in self.height_map.items():
                     if filename.startswith(f"{ddir}/{category_prefix}"):
-                        # file_idx = int(filename.split('/')[-1].replace(category_prefix, "").replace('.jpg', '').lstrip('0'))
                         num_part = filename.split('_')[-1].replace('.jpg', '')
                         file_idx = int(num_part)
                         angle_idx = [category_idx, file_idx]
-                        final_label = vec_AR + vec_LR + vec_TR + angle_idx
+                        # ── 修改：label 從 9-dim 擴充到 16-dim ──
+                        final_label = vec_AR + vec_LR + vec_TR + vec_mat + angle_idx
                         self.labels[filename] = final_label
                         break 
             root.append(ddir)
