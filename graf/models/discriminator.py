@@ -22,8 +22,7 @@ class Discriminator(nn.Module):
         assert shared_cond_proj is not None, "Must pass shared_cond_proj from NeRF"
         self._shared_cond_proj_holder = [shared_cond_proj]
 
-        input_nc = nc + cond_dim +  num_classes # 3 + 256
-
+        input_nc = nc + cond_dim + num_classes  # 3 + 256 + 7
 
         blocks = []
         if self.imsize == 64:
@@ -61,37 +60,42 @@ class Discriminator(nn.Module):
         )
 
         self.aux_head = nn.Sequential(
-                nn.AdaptiveAvgPool2d(1),
-                nn.Flatten(),
-                nn.Linear(ndf * 8, 32),                    # 512 → 32 bottleneck
-                nn.LeakyReLU(0.2, inplace=True),
-                nn.Linear(32, hidden_dim),                 # 32 → 1024
-            )
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(ndf * 8, 32),           # 512 → 32 bottleneck
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(32, hidden_dim),         # 32 → 1024
+        )
 
     def forward(self, input, label, hidden_state, return_aux=False):
-        input = input[:, :self.nc]
-        input = input.view(-1, self.imsize, self.imsize, self.nc).permute(0, 3, 1, 2)
+        """
+        input: [B, 3, H, W] 格式的影像 (不再接受 flattened pixels)
+        label: [B, >=14] — 使用 label[:,7:14] 作為材質條件
+        hidden_state: [B, hidden_dim]
+        """
+        bs = input.size(0)
+        h, w = input.size(2), input.size(3)
 
         if self.hflip:
             input_flipped = input.flip(3)
-            mask = torch.randint(0, 2, (len(input), 1, 1, 1)).bool().expand(-1, *input.shape[1:])
+            mask = torch.randint(0, 2, (bs, 1, 1, 1), device=input.device).bool().expand(-1, *input.shape[1:])
             input = torch.where(mask, input, input_flipped)
 
         # 用共享的 condition projection (1024 → 256)
         cond = self._shared_cond_proj_holder[0](hidden_state)  # [B, 256]
-        cond_map = cond.view(cond.size(0), self.cond_dim, 1, 1).expand(
-            -1, -1, input.size(2), input.size(3)
-        )
+        cond_map = cond.view(bs, self.cond_dim, 1, 1).expand(-1, -1, h, w)
 
-        label_cond = label[:,7:14].view(8, self.num_classes, 1, 1).expand(-1, -1, 64, 64)
+        # [修正] 不再硬編碼 batch_size=8 和 spatial=64
+        label_cond = label[:, 7:14].view(bs, self.num_classes, 1, 1).expand(-1, -1, h, w)
 
         x = torch.cat([input, label_cond, cond_map], dim=1)
         features = self.main(x)
         out = self.conv_out(features)
 
         if return_aux:
-            aux_pred = self.aux_head(features)  # [B, 1024]
-            label_pred = self.label_out(features)
+            aux_pred = self.aux_head(features)          # [B, 1024]
+            label_pred = self.label_out(features)       # [B, num_classes, 1, 1]
+            label_pred = label_pred.view(bs, -1)        # [修正] squeeze → [B, num_classes]
             return out, aux_pred, label_pred
-        
+
         return out

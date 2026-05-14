@@ -5,7 +5,7 @@ Phase 1 (iter 0 ~ phase2_start):
   - NeRF renders 64×64 full image (FullRaySampler, H=W=64)
   - D_low judges 64×64 (your existing Discriminator)
   - Real = resize(256→64)
-  - TTUR: lr_d=0.0004 > lr_g=0.0001
+  - Reverse-TTUR: lr_g=0.0003 > lr_d=0.0001
 
 Phase 2 (iter phase2_start ~):
   - Phase 1 continues (D_low still active)
@@ -134,6 +134,14 @@ class DiscriminatorHigh(nn.Module):
 
 
 # ================================================================
+# Helper: nerf_flat → [B, 3, 64, 64] image tensor
+# ================================================================
+def nerf_flat_to_img(nerf_flat, batch_size):
+    """Convert [B*4096, 3] flat NeRF output to [B, 3, 64, 64] image."""
+    return nerf_flat.view(batch_size, 64, 64, 3).permute(0, 3, 1, 2).contiguous()
+
+
+# ================================================================
 # Main
 # ================================================================
 def main():
@@ -152,6 +160,7 @@ def main():
     save_best   = config['training']['save_best']
     reg_param   = config['training']['reg_param']
     aux_loss_weight = config['training']['label_param']
+    mat_loss_weight = config['training'].get('mat_param', 0.1)  # [新增] mat loss 權重
     device = torch.device("cuda:0")
 
     use_amp = config['training'].get('use_amp', False)
@@ -170,6 +179,7 @@ def main():
     lambda_recon    = recon_config.get('lambda_recon', 0.1)
     print(f"[TwoStage] Phase1: 0~{phase2_start}  Phase2: {phase2_start}+")
     print(f"[Recon] enabled={use_recon}, λ={lambda_recon}")
+    print(f"[Weights] aux={aux_loss_weight}, mat={mat_loss_weight}, reg={reg_param}")
 
     out_dir, checkpoint_dir = setup_directories(config)
     save_config(os.path.join(out_dir, 'config.yaml'), config)
@@ -270,6 +280,8 @@ def main():
 
             x_real = x_real.to(device); label = label.to(device)
             mat = label[:, 7:14]; hidden_state = hidden_state.to(device)
+
+            # [修正] 直接用 [B, 3, 64, 64] 格式，不再 flatten
             x_real_64 = F.interpolate(x_real, size=(64,64), mode='bilinear', align_corners=True)
 
             generator.ray_sampler.iterations = it
@@ -278,26 +290,35 @@ def main():
 
             # ============ D_low (64×64) ============
             d_optimizer.zero_grad()
-            rgbs_real = x_real_64.permute(0,2,3,1).reshape(-1, 3)
-            rgbs_real.requires_grad_(True)
+
+            # [修正] 直接傳 [B, 3, 64, 64] image，不再 flatten 再 reshape
+            x_real_d = x_real_64.detach().requires_grad_(True)
             z = zdist.sample((batch_size,))
 
             with amp_ctx():
-                d_real_lo, aux_real, lab_real = discriminator(rgbs_real, label, hidden_state, return_aux=True)
+                d_real_lo, aux_real, lab_real = discriminator(x_real_d, label, hidden_state, return_aux=True)
                 dloss_real_lo = compute_loss(d_real_lo, 1)
                 aux_loss_real = F.mse_loss(aux_real, hidden_state)
                 mat_loss_real = F.mse_loss(lab_real, mat)
-            reg_lo = reg_param * compute_grad2(d_real_lo.float(), rgbs_real).mean()
+
+            # [修正] R1 正則化對 image tensor 計算，而非 flattened pixels
+            reg_lo = reg_param * compute_grad2(d_real_lo.float(), x_real_d).mean()
 
             with torch.no_grad(), amp_ctx():
                 rays_f = fullimg_rays(label, batch_size)
                 nerf_flat, _ = generator(z, label, hidden_state, rays=rays_f)
 
+            # [修正] 轉成 [B, 3, 64, 64] 再傳給 D_low
+            nerf_img_64 = nerf_flat_to_img(nerf_flat, batch_size)
+
             with amp_ctx():
-                d_fake_lo = discriminator(nerf_flat, label, hidden_state)
+                d_fake_lo = discriminator(nerf_img_64, label, hidden_state)
                 dloss_fake_lo = compute_loss(d_fake_lo, 0)
 
-            dlo_loss = dloss_real_lo + dloss_fake_lo + reg_lo + aux_loss_real + mat_loss_real
+            # [修正] mat_loss 加權重
+            dlo_loss = (dloss_real_lo + dloss_fake_lo + reg_lo
+                        + aux_loss_weight * aux_loss_real
+                        + mat_loss_weight * mat_loss_real)
             if use_scaler: scaler.scale(dlo_loss).backward(); scaler.step(d_optimizer); scaler.update()
             else: dlo_loss.backward(); d_optimizer.step()
             d_scheduler.step()
@@ -315,8 +336,7 @@ def main():
                 reg_hi = reg_param * compute_grad2(dr_hi.float(), xr_dh).mean()
 
                 with torch.no_grad():
-                    n64 = nerf_flat.view(batch_size, 64, 64, 3).permute(0,3,1,2).contiguous()
-                    sr256 = sr_network(n64)
+                    sr256 = sr_network(nerf_img_64)
                 with amp_ctx():
                     df_hi = d_high(sr256, label, hidden_state)
                     dloss_fake_hi = compute_loss(df_hi, 0)
@@ -339,25 +359,30 @@ def main():
                 rays_g = fullimg_rays(label, batch_size)
                 nerf_g, _ = generator(z, label, hidden_state, rays=rays_g)
 
-                dfl_g, aux_f, lab_f = discriminator(nerf_g, label, hidden_state, return_aux=True)
+                # [修正] 轉成 image 格式再傳 D_low
+                nerf_g_img = nerf_flat_to_img(nerf_g, batch_size)
+
+                dfl_g, aux_f, lab_f = discriminator(nerf_g_img, label, hidden_state, return_aux=True)
                 g_adv_lo = compute_loss(dfl_g, 1)
                 g_aux = F.mse_loss(aux_f, hidden_state)
                 mat_loss_f = F.mse_loss(lab_f, mat)
 
                 recon64 = torch.tensor(0., device=device)
                 if use_recon:
-                    np64 = nerf_g.view(batch_size, 64, 64, 3).permute(0,3,1,2).contiguous()
-                    recon64 = recon_loss_fn(np64, x_real_64)
+                    recon64 = recon_loss_fn(nerf_g_img, x_real_64)
 
                 g_adv_hi = sr_rec = torch.tensor(0., device=device)
                 if in_p2:
-                    n_img = nerf_g.view(batch_size,64,64,3).permute(0,3,1,2).contiguous()
-                    sr_g = sr_network(n_img)
+                    sr_g = sr_network(nerf_g_img)
                     dfh_g = d_high(sr_g, label, hidden_state)
                     g_adv_hi = compute_loss(dfh_g, 1)
                     sr_rec = recon_loss_fn(sr_g, x_real)
 
-                gloss = g_adv_lo + lambda_recon * recon64 + g_aux + mat_loss_f
+                # [修正] mat_loss 加權重
+                gloss = (g_adv_lo
+                         + lambda_recon * recon64
+                         + aux_loss_weight * g_aux
+                         + mat_loss_weight * mat_loss_f)
                 if in_p2:
                     gloss = gloss + lambda_d_high * g_adv_hi + lambda_recon_sr * sr_rec
 
@@ -439,7 +464,8 @@ def main():
                             _, li, hi = train_dataset[i]; ll.append(li); hl.append(hi)
                         lb = torch.stack(ll).to(device); hb = torch.stack(hl).to(device)
                         ps = torch.stack([generator.sample_select_pose(
-                            int(lb[i,8].item())/360., v_list[int(lb[i,7].item())%n_heights])
+                            int(lb[i, 15].item()) / 360.,          # ← 改成 15
+                            v_list[int(lb[i, 14].item()) % n_heights])  # ← 改成 14
                             for i in range(batch_size)])
                         zf = zdist.sample((batch_size,))
                         with torch.no_grad(): r,_,_ = evaluator.create_samples(zf, lb, hb, ps)

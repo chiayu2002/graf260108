@@ -4,9 +4,11 @@ import torch.utils.data
 import torch.utils.data.distributed
 from torch import autograd
 import torch.nn as nn
+import torch.nn.functional as F
 import pickle
 import numpy as np
 import os
+import torchvision.models as models
 
 
 class MCE_Loss(nn.Module):
@@ -50,9 +52,10 @@ class CCSRLoss(nn.Module):
         real_feat = self.vgg(real_patch_norm)
         perceptual_loss = F.mse_loss(sr_feat, real_feat)
         
-        # 3. 總和：知覺損失權重通常較大以降低 FID
-        return l1_loss + 0.5 * perceptual_loss #l1_loss 
-    
+        # 3. [修正] VGG perceptual weight 從 0.5 降到 0.01
+        #    VGG 在 64×64 小圖上 receptive field 過大，高權重會造成不穩定梯度
+        return l1_loss + 0.01 * perceptual_loss
+
 
 def compute_loss(d_outs, target_value):
     """
@@ -146,154 +149,3 @@ def save_data(label, rays, iteration, save_dir='./saved_data'):
 
     # 恢復 numpy 的默認顯示選項
     np.set_printoptions(threshold=1000)
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.models as models
-
-class FeatureOrientationLoss:
-    """
-    基於特徵的物體方向規範化損失
-    """
-    def __init__(self, device='cuda:0'):
-        # 初始化 ResNet-50 特徵提取器
-        self.device = device
-        resnet = models.resnet50(pretrained=True)
-        # 使用 layer3 作為特徵提取層
-        self.feature_extractor = nn.Sequential(*list(resnet.children())[:7])
-        self.feature_extractor = self.feature_extractor.to(device).eval()
-        
-        # 固定特徵提取器的權重
-        for param in self.feature_extractor.parameters():
-            param.requires_grad = False
-            
-        # 預設標準視角
-        self.standard_views = [(0.0, 0.5), (0.25, 0.5), (0.5, 0.5), (0.75, 0.5)]  # 前、右、後、左
-        
-        # 特徵關係初始化為None，第一次運行時將建立標準關係
-        self.feature_relations = None
-        self.is_initialized = False
-    
-    def _extract_features(self, generator, z, label, pose):
-        """從特定角度提取特徵"""
-        rays = generator.val_ray_sampler(generator.H, generator.W, generator.focal, pose)[0]
-        
-        with torch.no_grad():
-            rgb, rays = generator(z, label, rays=rays)
-            
-            # 將渲染結果重塑為圖像格式 (B, C, H, W)
-            H, W = generator.H, generator.W
-            img = rgb.view(-1, H, W, 3).permute(0, 3, 1, 2)
-            
-            # 檢查尺寸並進行調整，確保符合ResNet輸入要求
-            if img.shape[2] < 32 or img.shape[3] < 32:
-                img = F.interpolate(img, size=(224, 224), mode='bilinear', align_corners=False)
-            
-            # # 將像素值範圍從 [-1, 1] 調整到 [0, 1]
-            # img = (img + 1) / 2.0
-            
-            # 提取特徵
-            features = self.feature_extractor(img)
-            
-            # 對特徵進行降維，簡化計算
-            features = features.mean(dim=(2, 3))  # 對空間維度進行平均池化
-            
-            return features
-    
-    def initialize_feature_relations(self, generator, z, label):
-        """初始化標準特徵關係"""
-        if self.is_initialized:
-            return
-        
-        print("正在初始化方向一致性特徵關係...")
-        
-        # 獲取不同視角的特徵
-        view_features = []
-        for u, v in self.standard_views:
-            pose = generator.sample_select_pose(u, v).to(self.device)
-            features = self._extract_features(generator, z, label, pose)
-            view_features.append(features)
-        
-        # 建立視角之間的特徵關係
-        self.feature_relations = {}
-        for i in range(len(self.standard_views)):
-            for j in range(i+1, len(self.standard_views)):
-                # 計算兩個視角之間的特徵差異作為標準關係
-                relation_key = (i, j)
-                feature_diff = view_features[i] - view_features[j]
-                self.feature_relations[relation_key] = feature_diff.detach()  # 分離計算圖
-        
-        self.is_initialized = True
-        print("方向一致性特徵關係初始化完成")
-
-    def save_feature_relations(self, path):
-        """保存標準特徵關係到文件"""
-        if not self.is_initialized:
-            print("錯誤：特徵關係尚未初始化，無法保存")
-            return
-        
-        save_data = {
-            'feature_relations': self.feature_relations,
-            'standard_views': self.standard_views
-        }
-        torch.save(save_data, path)
-        print(f"特徵關係已保存到 {path}")
-
-    def load_feature_relations(self, path):
-        """從文件加載標準特徵關係"""
-        if not os.path.exists(path):
-            print(f"錯誤：找不到文件 {path}")
-            return False
-        
-        try:
-            save_data = torch.load(path)
-            self.feature_relations = save_data['feature_relations']
-            self.standard_views = save_data['standard_views']
-            self.is_initialized = True
-            print(f"特徵關係已從 {path} 加載")
-            return True
-        except Exception as e:
-            print(f"加載特徵關係時出錯: {e}")
-            return False
-    
-    def __call__(self, generator, z_batch, label_batch):
-        """計算方向一致性損失"""
-        batch_size = z_batch.size(0)
-        
-        # 如果是第一次調用，先初始化特徵關係
-        if not self.is_initialized:
-            with torch.no_grad():
-                self.initialize_feature_relations(generator, z_batch[0:1], label_batch[0:1])
-        
-        total_loss = 0.0
-        
-        # 為了節省計算資源，可以只對批次中的部分樣本計算損失
-        sample_size = min(batch_size, 4)  # 最多使用4個樣本計算損失
-        indices = torch.randperm(batch_size)[:sample_size]
-        
-        for idx in indices:
-            z = z_batch[idx:idx+1]
-            label = label_batch[idx:idx+1]
-            
-            # 獲取不同視角的特徵
-            view_features = []
-            for u, v in self.standard_views:
-                pose = generator.sample_select_pose(u, v).to(self.device)
-                features = self._extract_features(generator, z, label, pose)
-                view_features.append(features)
-            
-            # 計算視角之間的特徵關係並與標準關係比較
-            view_loss = 0.0
-            for (i, j), standard_relation in self.feature_relations.items():
-                # 計算當前樣本的特徵關係
-                current_relation = view_features[i] - view_features[j]
-                
-                # 計算與標準關係的差異，使用L1損失以減少離群值影響
-                rel_loss = F.l1_loss(current_relation, standard_relation)
-                view_loss += rel_loss
-            
-            total_loss += view_loss
-        
-        # 平均損失
-        return total_loss / sample_size if sample_size > 0 else 0.0

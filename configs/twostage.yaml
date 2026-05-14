@@ -1,4 +1,4 @@
-expname: column20260510_twostage_ttur_fullimg64_sr256
+expname: column20260510_twostage_v2_revttur_lowrecon
 data:
   datadir: [data/RS307_n, data/RS330_n, data/RS615_n]
   extractor_path: /Data/home/vicky/graf260108_im64/HystereticGRU/2026-03-24_17-13-01/Opensees Based damage Patterns Generation/c7d0zrxf/checkpoints/best.ckpt
@@ -36,10 +36,10 @@ nerf:
   netwidth_fine: 256
   num_classes: 7
 ray_sampler:
-  N_samples: 4096          # 64×64 = 4096，跟之前一樣
+  N_samples: 4096          # 64×64 = 4096
   max_scale: 1.0
   min_scale: 0.25
-  scale_anneal: 0.01       # Phase 1 不用 FlexGrid，但保留設定
+  scale_anneal: 0.01
 training:
   backup_every: 50000
   batch_size: 8
@@ -47,6 +47,9 @@ training:
   equalize_lr: false
   fid_every: 10000
   gan_type: standard
+  # ========================================================
+  # [修正] 反向 TTUR：G 學快、D 學慢，解決 D 太強問題
+  # ========================================================
   lr_g: 0.0003
   lr_d: 0.0001
   lr_anneal: 0.5
@@ -60,7 +63,11 @@ training:
   outdir: ./results
   print_every: 10
   reg_param: 10.0
-  label_param: 0.5
+  # ========================================================
+  # [修正] aux/mat loss 權重分開控制
+  # ========================================================
+  label_param: 0.5         # aux_loss (hidden_state 預測) 權重
+  mat_param: 0.1           # [新增] mat_loss (材質 label 預測) 權重
   restart_every: -1
   sample_every: 5000
   save_best: fid
@@ -71,9 +78,9 @@ training:
   # ========================================================
   # [兩階段設定]
   # ========================================================
-  phase2_start_iter: 100000    # Phase 2 開始的 iteration
-  lambda_d_high: 1.0           # D_high loss 的權重
-  lambda_recon_sr: 1.0         # SR recon loss (L1+VGG) 的權重
+  phase2_start_iter: 100000
+  lambda_d_high: 1.0
+  lambda_recon_sr: 1.0
 z_dist:
   dim: 256
   type: gauss
@@ -81,10 +88,13 @@ ccsr:
   enabled: false
   num_views: 8
   scale_factor: 1
+# ========================================================
+# [修正] recon loss 大幅降低，避免壓過對抗信號
+# ========================================================
 reconstruction:
   enabled: true
-  lambda_recon: 0.05
+  lambda_recon: 0.05       # 從 0.5 降到 0.05
 wandb:
   project: graf260108
   entity: vicky20020808
-  name: column20260510_twostage_ttur_fullimg64_sr256
+  name: column20260510_twostage_v2_revttur_lowrecon

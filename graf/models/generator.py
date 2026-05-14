@@ -131,7 +131,7 @@ class Generator(object):
             return rgb_nerf, rays
 
     def decrease_nerf_noise(self, it):
-        end_it = 5000
+        end_it = 30000
         if it < end_it:
             noise_std = self.initial_raw_noise_std - self.initial_raw_noise_std/end_it * it
             self.render_kwargs_train['raw_noise_std'] = noise_std
